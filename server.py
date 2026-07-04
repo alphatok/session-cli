@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,28 @@ _progress_lock = threading.Lock()
 _active_tasks: dict[str, threading.Event] = {}  # task_id → cancel_event
 _active_tasks_lock = threading.Lock()
 
+# ── 全局日志 ─────────────────────────────────────────────────
+
+_log_queue: queue.Queue = queue.Queue()
+_log_history: list = []  # 最多保留 200 条
+_log_lock = threading.Lock()
+_MAX_LOG_HISTORY = 200
+
+
+def _emit_log(stage: str, detail: str):
+    """发送日志到所有输出通道：console、日志队列、历史记录。"""
+    global _log_history
+    entry = {"stage": stage, "detail": detail, "time": time.strftime("%H:%M:%S")}
+    # 1. Console
+    print(f"[{entry['time']}] [{stage}] {detail}")
+    # 2. 日志队列（SSE 推送）
+    _log_queue.put(entry)
+    # 3. 历史记录
+    with _log_lock:
+        _log_history.append(entry)
+        if len(_log_history) > _MAX_LOG_HISTORY:
+            _log_history = _log_history[-_MAX_LOG_HISTORY:]
+
 
 def _get_or_create_queue(task_id: str) -> queue.Queue:
     with _progress_lock:
@@ -63,27 +86,48 @@ def _run_grab_task(task_id: str, domain: str):
 
     def on_progress(stage, detail):
         q.put(json.dumps({"stage": stage, "detail": detail}))
+        _emit_log(stage, detail)
 
+    _emit_log("task", f"开始抓取: {domain}")
     try:
         data = grab_cookies_managed(domain, on_progress=on_progress, cancel_event=cancel_event)
         cookies = data.get("cookies", {})
         auth_tokens = data.get("auth_tokens", [])
-        if not cookies and not auth_tokens:
-            q.put(json.dumps({"stage": "error", "detail": "未获取到 Cookie 和认证凭据，请确认已登录"}))
+        headers = data.get("headers", {})
+        raw_requests = data.get("raw_requests", [])
+        related_domains = data.get("related_domains", [])
+        if not cookies and not auth_tokens and not headers:
+            msg = "未获取到 Cookie、认证凭据和请求头，请确认已登录"
+            q.put(json.dumps({"stage": "error", "detail": msg}))
+            _emit_log("error", msg)
             return
-        core.store_site(domain, data)
+        # 提取纯 domain 用于 Vault 存储 key
+        store_domain = domain.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
+        core.store_site(store_domain, data)
+        parts = []
+        if headers or raw_requests:
+            parts.append(f"{len(headers)} 个公共 Header, {len(raw_requests)} 个原始请求")
+        if related_domains:
+            parts.append(f"{len(related_domains)} 个关联域名")
+        hdr_msg = (", " + ", ".join(parts)) if parts else ""
         q.put(json.dumps({
             "stage": "completed",
-            "detail": f"成功存储 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据",
+            "detail": f"成功存储 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据{hdr_msg}",
             "count": len(cookies),
             "auth_count": len(auth_tokens),
+            "header_count": len(headers),
+            "raw_request_count": len(raw_requests),
+            "related_domain_count": len(related_domains),
         }))
+        _emit_log("completed", f"抓取完成: {domain} ({len(cookies)} cookies, {len(auth_tokens)} tokens)")
     except Exception as e:
         msg = str(e)
         if cancel_event.is_set():
             q.put(json.dumps({"stage": "cancelled", "detail": msg}))
+            _emit_log("cancelled", msg)
         else:
             q.put(json.dumps({"stage": "error", "detail": msg}))
+            _emit_log("error", msg)
     finally:
         # 清理
         with _active_tasks_lock:
@@ -100,24 +144,30 @@ async def lifespan(app: FastAPI):
         vault = core.get_vault()
         vault.list_sessions()  # 验证 vault 可用
         print("[✓] Vault 已解锁（keyring 自动获取密码）")
+        _emit_log("system", "Vault 已解锁")
     except Exception as e:
         print(f"[!] Vault 解锁失败: {e}")
         print("[!] 请先执行: uv run python main.py init")
-    yield
-    # 清理：关闭 MCP 连接 + SSE 队列 + 取消活跃任务
-    with _active_tasks_lock:
-        for evt in _active_tasks.values():
-            evt.set()
-        _active_tasks.clear()
+        _emit_log("error", f"Vault 解锁失败: {e}")
     try:
-        mgr = McpManager.get_instance()
-        if mgr.is_connected():
-            mgr.disconnect()
-            print("[✓] MCP 连接已关闭")
-    except Exception:
-        pass
-    with _progress_lock:
-        _progress_queues.clear()
+        yield
+    finally:
+        # 清理：关闭 MCP 连接 + SSE 队列 + 取消活跃任务
+        print("[*] 正在关闭服务...")
+        with _active_tasks_lock:
+            for evt in _active_tasks.values():
+                evt.set()
+            _active_tasks.clear()
+        try:
+            mgr = McpManager.get_instance()
+            if mgr.is_connected():
+                mgr.disconnect()
+                print("[✓] MCP 连接已关闭")
+        except Exception:
+            pass
+        with _progress_lock:
+            _progress_queues.clear()
+        print("[✓] 服务已关闭")
 
 
 app = FastAPI(title="Session Manager", version="2.0", lifespan=lifespan)
@@ -224,6 +274,35 @@ async def api_cancel_grab(task_id: str):
     return {"status": "cancelling", "task_id": task_id}
 
 
+# ── 日志 API ────────────────────────────────────────────────
+
+@app.get("/api/logs/recent")
+async def api_logs_recent():
+    """返回最近日志列表。"""
+    with _log_lock:
+        return list(_log_history)
+
+
+@app.get("/api/logs/stream")
+async def api_logs_stream():
+    """SSE 流式推送日志。"""
+    async def event_stream():
+        # 先发送历史日志
+        with _log_lock:
+            for entry in _log_history:
+                yield f"data: {json.dumps(entry)}\n\n"
+        # 持续推送新日志
+        while True:
+            try:
+                entry = _log_queue.get(timeout=0.5)
+                yield f"data: {json.dumps(entry)}\n\n"
+            except queue.Empty:
+                yield ": keepalive\n\n"
+                await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 # ── MCP 连接管理 ─────────────────────────────────────────────
 
 @app.get("/api/mcp/status")
@@ -234,20 +313,29 @@ async def api_mcp_status():
 
 
 @app.post("/api/mcp/connect")
-async def api_mcp_connect():
-    """手动连接 MCP（含 CDP 健康检查）。"""
+async def api_mcp_connect(browser_mode: str = Query("user")):
+    """手动连接 MCP（含 CDP 健康检查）。
+
+    Args:
+        browser_mode: "user" 使用用户已登录的浏览器，"temp" 启动临时浏览器
+    """
     mgr = McpManager.get_instance()
     if mgr.is_connected():
         ok, msg = mgr.health_check()
         if ok:
-            return {"status": "already_connected", "cdp_status": msg}
+            _emit_log("mcp", "MCP 已连接（复用现有连接）")
+            return {"status": "already_connected", "cdp_status": msg, "browser_mode": mgr.get_status().get("browser_mode")}
         else:
             # CDP 已断开，尝试重连
+            _emit_log("mcp", "CDP 连接丢失，重新连接中...")
             mgr.disconnect()
     try:
-        mgr.connect()
-        return {"status": "connected", "cdp_status": "CDP 连接正常"}
+        _emit_log("mcp", f"正在连接 MCP（{'临时浏览器' if browser_mode == 'temp' else '用户浏览器'}）...")
+        mgr.connect(browser_mode=browser_mode)
+        _emit_log("mcp", "MCP 连接成功")
+        return {"status": "connected", "cdp_status": "CDP 连接正常", "browser_mode": browser_mode}
     except RuntimeError as e:
+        _emit_log("error", f"MCP 连接失败: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -258,4 +346,5 @@ async def api_mcp_disconnect():
     if not mgr.is_connected():
         return {"status": "not_connected"}
     mgr.disconnect()
+    _emit_log("mcp", "MCP 已断开")
     return {"status": "disconnected"}

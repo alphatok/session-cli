@@ -10,6 +10,8 @@ import pytest
 from core.session import (
     list_sites, get_site, store_site, delete_site,
     _encode_auth_tokens, _decode_auth_tokens,
+    _encode_headers, _decode_headers,
+    _encode_related, _decode_related,
 )
 
 
@@ -99,10 +101,11 @@ class TestStoreSite:
         v.store_session.side_effect = capture_store
         mock_get_vault.return_value = v
 
-        data = {"cookies": {"key": "val"}, "auth_tokens": []}
+        data = {"cookies": {"key": "val"}, "auth_tokens": [], "headers": {}, "raw_requests": []}
         result = store_site("test.com", data)
         assert result["domain"] == "test.com"
         assert result["cookie_count"] == 1
+        assert result["header_count"] == 0
 
         call_kwargs = v.store_session.call_args[1]
         assert "expires_at" in call_kwargs
@@ -222,3 +225,220 @@ class TestAuthTokenEncodeDecode:
 
         assert pure == sample_grab_enriched["cookies"]
         assert len(auth) == len(sample_grab_enriched["auth_tokens"])
+
+
+# ── Header 编解码测试 ──────────────────────────────────────────
+
+
+class TestHeaderEncodeDecode:
+    """公共 Header 和 raw_requests 的 __hdr__ 编码/解码。"""
+
+    def test_encode_headers(self):
+        """Header 以 __hdr__ 前缀编码。"""
+        headers = {"Authorization": "Bearer xxx", "User-Agent": "Mozilla/5.0"}
+        encoded = _encode_headers(headers, [])
+        assert encoded["__hdr__Authorization"] == "Bearer xxx"
+        assert encoded["__hdr__User-Agent"] == "Mozilla/5.0"
+        assert "__raw__requests" not in encoded
+
+    def test_encode_raw_requests(self):
+        """raw_requests 编码为 JSON blob（单键）。"""
+        raw = [
+            {"url": "https://example.com/api", "method": "GET",
+             "headers": {"Authorization": "Bearer xxx"}},
+        ]
+        encoded = _encode_headers({}, raw)
+        assert "__raw__requests" in encoded
+        import json
+        decoded_raw = json.loads(encoded["__raw__requests"])
+        assert decoded_raw == raw
+
+    def test_encode_both(self):
+        headers = {"Authorization": "Bearer xxx"}
+        raw = [{"url": "a", "method": "GET", "headers": {}}]
+        encoded = _encode_headers(headers, raw)
+        assert "__hdr__Authorization" in encoded
+        assert "__raw__requests" in encoded
+
+    def test_decode_headers(self, sample_header_encoded_cookies):
+        """解码分离出 headers 和 raw_requests。"""
+        headers, raw = _decode_headers(sample_header_encoded_cookies)
+        assert headers["Authorization"] == "Bearer xxx"
+        assert headers["User-Agent"] == "Mozilla/5.0"
+        assert len(raw) == 1
+        assert raw[0]["url"] == "https://example.com/api/me"
+
+    def test_decode_empty(self):
+        """无 __hdr__ 前缀时返回空。"""
+        headers, raw = _decode_headers({"a": "1", "b": "2"})
+        assert headers == {}
+        assert raw == []
+
+    def test_decode_invalid_raw_json(self):
+        """损坏的 raw_requests JSON 不崩溃。"""
+        dat = {"__raw__requests": "not valid json {{{"}
+        headers, raw = _decode_headers(dat)
+        assert raw == []
+
+    def test_roundtrip(self, sample_grab_with_headers):
+        """Header 编解码往返保持完整性。"""
+        encoded = _encode_headers(
+            sample_grab_with_headers["headers"],
+            sample_grab_with_headers["raw_requests"],
+        )
+        headers, raw = _decode_headers(encoded)
+        assert headers == sample_grab_with_headers["headers"]
+        assert raw == sample_grab_with_headers["raw_requests"]
+
+
+class TestStoreSiteWithHeaders:
+    """store_site / get_site 支持 headers + raw_requests。"""
+
+    @patch("core.session.get_vault")
+    def test_store_with_headers(self, mock_get_vault, sample_grab_with_headers):
+        """存储含 headers + raw_requests 的数据。"""
+        v = MagicMock()
+        stored_all = {}
+
+        def capture_store(**kwargs):
+            nonlocal stored_all
+            stored_all = dict(kwargs["cookies"])
+
+        v.store_session.side_effect = capture_store
+        mock_get_vault.return_value = v
+
+        result = store_site("example.com", sample_grab_with_headers)
+        assert result["cookie_count"] == 2
+        assert result["auth_token_count"] == 1
+        assert result["header_count"] == 3
+        assert result["raw_request_count"] == 2
+
+        # 验证编码：Vault 中应有 __hdr__ 前缀键
+        assert "__hdr__Authorization" in stored_all
+        assert "__hdr__User-Agent" in stored_all
+        assert "__raw__requests" in stored_all
+
+    @patch("core.session.get_vault")
+    def test_get_site_with_headers(self, mock_get_vault):
+        """从 Vault 读取含 headers 的站点详情。"""
+        import json
+        raw = json.dumps([
+            {"url": "https://example.com/api", "method": "GET",
+             "headers": {"Authorization": "Bearer xxx"}},
+        ])
+        s = MagicMock()
+        s.domain = "example.com"
+        s.cookies = {
+            "token": "abc",
+            "__hdr__Authorization": "Bearer xxx",
+            "__hdr__Accept": "application/json",
+            "__raw__requests": raw,
+        }
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = get_site("example.com")
+        assert result["headers"] == {"Authorization": "Bearer xxx", "Accept": "application/json"}
+        assert result["header_count"] == 2
+        assert result["raw_request_count"] == 1
+        assert result["raw_requests"][0]["url"] == "https://example.com/api"
+
+    @patch("core.session.get_vault")
+    def test_backward_compatible_no_headers(self, mock_get_vault):
+        """旧数据（无 headers）读取时不崩溃，返回空。"""
+        s = MagicMock()
+        s.domain = "old.com"
+        s.cookies = {"token": "abc", "uid": "123"}
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = get_site("old.com")
+        assert result["headers"] == {}
+        assert result["header_count"] == 0
+        assert result["raw_requests"] == []
+        assert result["raw_request_count"] == 0
+        assert result["related_domains"] == []
+        assert result["related_domain_count"] == 0
+
+
+# ── 关联域名编解码测试 ──────────────────────────────────────────
+
+
+class TestRelatedDomainsEncodeDecode:
+    """关联域名的 __rel__ 编码/解码。"""
+
+    def test_encode_related(self):
+        related = ["api.example.com", "cdn.cloudflare.com", "google.com"]
+        encoded = _encode_related(related)
+        assert "__rel__domains" in encoded
+        import json
+        decoded = json.loads(encoded["__rel__domains"])
+        assert "api.example.com" in decoded
+        assert "google.com" in decoded
+
+    def test_encode_deduplicates(self):
+        related = ["api.example.com", "api.example.com", "google.com"]
+        encoded = _encode_related(related)
+        import json
+        decoded = json.loads(encoded["__rel__domains"])
+        assert len(decoded) == 2
+
+    def test_encode_empty(self):
+        assert _encode_related([]) == {}
+        assert _encode_related([""]) == {}
+
+    def test_decode_related(self):
+        import json
+        dat = {"__rel__domains": json.dumps(["a.com", "b.com"])}
+        result = _decode_related(dat)
+        assert result == ["a.com", "b.com"]
+
+    def test_decode_empty(self):
+        assert _decode_related({}) == []
+        assert _decode_related({"token": "abc"}) == []
+
+    def test_decode_invalid_json(self):
+        dat = {"__rel__domains": "not valid json {{{"}
+        assert _decode_related(dat) == []
+
+    def test_roundtrip(self):
+        related = ["api.example.com", "cdn.cloudflare.com", "google.com"]
+        encoded = _encode_related(related)
+        decoded = _decode_related(encoded)
+        assert decoded == sorted(related)
+
+
+class TestStoreSiteWithRelated:
+    """store_site / get_site 支持 related_domains。"""
+
+    @patch("core.session.get_vault")
+    def test_store_with_related(self, mock_get_vault):
+        """存储含 related_domains 的数据。"""
+        v = MagicMock()
+        stored_all = {}
+
+        def capture_store(**kwargs):
+            nonlocal stored_all
+            stored_all = dict(kwargs["cookies"])
+
+        v.store_session.side_effect = capture_store
+        mock_get_vault.return_value = v
+
+        data = {
+            "cookies": {"token": "abc"},
+            "auth_tokens": [],
+            "headers": {},
+            "raw_requests": [],
+            "related_domains": ["api.example.com", "cdn.cloudflare.com"],
+        }
+        result = store_site("example.com", data)
+        assert result["related_domain_count"] == 2
+        assert "__rel__domains" in stored_all

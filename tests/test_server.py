@@ -150,9 +150,14 @@ class TestRunGrabTask:
         # 先获取队列引用（_run_grab_task 完成后会清理 dict，需要提前保留引用）
         q = _get_or_create_queue("t-success")
 
-        with patch("core.grab_cookies") as mock_grab, \
+        with patch("server.grab_cookies_managed") as mock_grab, \
              patch("core.store_site") as mock_store:
-            mock_grab.return_value = {"token": "abc"}
+            mock_grab.return_value = {
+                "cookies": {"token": "abc"},
+                "auth_tokens": [],
+                "headers": {},
+                "raw_requests": [],
+            }
             mock_store.return_value = {"domain": "test.com", "cookie_count": 1}
 
             _run_grab_task("t-success", "test.com")
@@ -171,7 +176,9 @@ class TestRunGrabTask:
 
         q = _get_or_create_queue("t-empty")
 
-        with patch("core.grab_cookies", return_value={}):
+        with patch("server.grab_cookies_managed", return_value={
+            "cookies": {}, "auth_tokens": [], "headers": {}, "raw_requests": [],
+        }):
             _run_grab_task("t-empty", "test.com")
 
         msg = q.get(timeout=0.5)
@@ -188,7 +195,7 @@ class TestRunGrabTask:
 
         q = _get_or_create_queue("t-error")
 
-        with patch("core.grab_cookies", side_effect=RuntimeError("Boom")):
+        with patch("server.grab_cookies_managed", side_effect=RuntimeError("Boom")):
             _run_grab_task("t-error", "test.com")
 
         msg = q.get(timeout=0.5)

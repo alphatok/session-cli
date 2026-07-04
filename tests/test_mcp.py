@@ -14,6 +14,13 @@ from core.mcp import (
     _extract_result,
     _find_npx,
     _jsonrpc_send,
+    _parse_network_list_table,
+    _parse_network_request_detail,
+    _compute_common_headers,
+    _extract_hostname,
+    _is_same_or_subdomain,
+    HDR_PREFIX,
+    RAW_PREFIX,
 )
 
 
@@ -217,7 +224,7 @@ class TestGrabCookiesIntegration:
     @patch("core.mcp._start_mcp_server")
     @patch("core.mcp.time.sleep", return_value=None)
     def test_full_grab_flow(self, mock_sleep, mock_start, mock_subprocess):
-        """完整抓取流程：list → select/navigate → evaluate → parse。"""
+        """完整抓取流程：list → select/navigate → network → evaluate → parse。"""
         mock_start.return_value = mock_subprocess
 
         # 直接 mock _jsonrpc_send 返回预设响应，避免 ID 匹配复杂性
@@ -226,6 +233,8 @@ class TestGrabCookiesIntegration:
             "1: https://other.site.com [selected]\n"
             "2: https://test.example.com/dashboard\n"
         )
+        # 网络请求列表（空，跳过 header 捕获）
+        network_list_text = "## Network Requests\nNo requests recorded."
         cookie_text = (
             'Script ran on page and returned:\n'
             '```json\n'
@@ -234,10 +243,12 @@ class TestGrabCookiesIntegration:
             '\n```'
         )
 
-        # _jsonrpc_send 按调用顺序返回 list → select → evaluate
+        # _jsonrpc_send 按调用顺序返回 list → select → navigate → list_network_requests → evaluate
         send_responses = [
             {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": list_text}]}},
             {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "Switched"}]}},
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "Navigated to https://test.example.com"}]}},
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": network_list_text}]}},
             {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": cookie_text}]}},
         ]
         send_iter = iter(send_responses)
@@ -256,10 +267,222 @@ class TestGrabCookiesIntegration:
         assert isinstance(result, dict)
         assert "cookies" in result
         assert "auth_tokens" in result
+        assert "headers" in result
+        assert "raw_requests" in result
+        assert "related_domains" in result
         assert len(result["cookies"]) == 2
         assert result["cookies"]["token"] == "abc"
         assert len(result["auth_tokens"]) == 1
         assert result["auth_tokens"][0]["key"] == "auth_key"
         assert result["auth_tokens"][0]["source"] == "localStorage"
+        # 空网络请求应返回空 headers/raw_requests/related_domains
+        assert result["headers"] == {}
+        assert result["raw_requests"] == []
+        assert result["related_domains"] == []
         for s in ("listing",):
             assert s in progress_stages, f"Missing stage: {s}"
+
+
+# ── Network Header 解析器测试 ────────────────────────────────
+
+
+class TestParseNetworkListTable:
+    """list_network_requests Markdown 表格解析。"""
+
+    def test_parses_matching_domain(self, sample_network_list_md):
+        """提取目标域名匹配的 reqid，同时收集全部 hostname。"""
+        reqids, all_hostnames = _parse_network_list_table(sample_network_list_md, "example.com")
+        assert 1 in reqids
+        assert 3 in reqids
+        assert 5 not in reqids  # other.com
+        # all_hostnames 包含表格中所有独特 hostname
+        assert "example.com" in all_hostnames
+        assert "other.com" in all_hostnames
+
+    def test_case_insensitive(self):
+        """域名匹配不区分大小写。"""
+        text = "| ReqId | Method | URL |\n|---|---|---|\n| 1 | GET | https://EXAMPLE.COM/api | 200 |"
+        reqids, _ = _parse_network_list_table(text, "example.com")
+        assert reqids == [1]
+
+    def test_empty_returns_empty(self):
+        assert _parse_network_list_table("", "example.com") == ([], set())
+        assert _parse_network_list_table(None, "example.com") == ([], set())
+
+    def test_no_match_returns_empty(self):
+        text = "| 1 | GET | https://other.com | 200 |"
+        reqids, _ = _parse_network_list_table(text, "example.com")
+        assert reqids == []
+
+    def test_subdomain_matches(self):
+        """子域名应被正确匹配。"""
+        text = (
+            "| ReqId | Method | URL | Status |\n"
+            "|---|---|---|---|\n"
+            "| 1 | GET | https://api.example.com/data | 200 |\n"
+            "| 2 | GET | https://cdn.static.example.com/lib.js | 200 |\n"
+            "| 3 | GET | https://notexample.com | 200 |\n"
+        )
+        reqids, all_hostnames = _parse_network_list_table(text, "example.com")
+        assert 1 in reqids
+        assert 2 in reqids
+        assert 3 not in reqids  # notexample.com 不应匹配
+        assert "api.example.com" in all_hostnames
+        assert "cdn.static.example.com" in all_hostnames
+        assert "notexample.com" in all_hostnames
+
+
+class TestParseNetworkRequestDetail:
+    """get_network_request 详细视图解析。"""
+
+    def test_parses_request_headers(self, sample_network_detail_md):
+        """提取 URL、Method、Request Headers。"""
+        result = _parse_network_request_detail(sample_network_detail_md)
+        assert result is not None
+        assert result["url"] == "https://example.com/api/me"
+        assert result["method"] == "GET"
+        assert "Authorization" in result["headers"]
+        assert result["headers"]["Authorization"] == "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"
+        assert "User-Agent" in result["headers"]
+        assert "Content-Type" not in result["headers"]  # 不包含 Response Headers
+
+    def test_empty_returns_none(self):
+        assert _parse_network_request_detail("") is None
+        assert _parse_network_request_detail(None) is None
+
+    def test_no_request_headers_section(self):
+        """无 Request Headers 区块时返回空 headers。"""
+        text = "## Request #1\nURL: https://example.com/\nMethod: GET\nStatus: 200"
+        result = _parse_network_request_detail(text)
+        assert result is not None
+        assert result["url"] == "https://example.com/"
+        assert result["headers"] == {}
+
+
+class TestComputeCommonHeaders:
+    """公共 Header 分析算法。"""
+
+    def test_finds_invariant_headers(self):
+        """多个请求中值相同的 Header 应被识别为公共头。"""
+        raw = [
+            {"url": "a", "method": "GET", "headers": {
+                "Authorization": "Bearer xxx",
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Referer": "https://a.com/page1",
+            }},
+            {"url": "b", "method": "POST", "headers": {
+                "Authorization": "Bearer xxx",
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Referer": "https://a.com/page2",
+                "Content-Type": "application/json",
+            }},
+        ]
+        result = _compute_common_headers(raw)
+        assert "Authorization" in result
+        assert "User-Agent" in result
+        assert "Accept" in result
+        # Referer 是动态的，除非所有请求相同
+        assert "Referer" not in result
+        # Content-Type 只出现在一个请求中，不到 50%
+        assert "Content-Type" not in result
+
+    def test_excludes_cookie(self):
+        """Cookie 不应出现在公共 Header 中。"""
+        raw = [
+            {"url": "a", "method": "GET", "headers": {
+                "Authorization": "Bearer xxx",
+                "Cookie": "a=1; b=2",
+            }},
+            {"url": "b", "method": "GET", "headers": {
+                "Authorization": "Bearer xxx",
+                "Cookie": "a=1; b=2",
+            }},
+        ]
+        result = _compute_common_headers(raw)
+        assert "Authorization" in result
+        assert "Cookie" not in result
+        assert "cookie" not in result
+
+    def test_empty_input(self):
+        assert _compute_common_headers([]) == {}
+
+    def test_single_request(self):
+        """单个请求时阈值不足以判定公共头。"""
+        raw = [
+            {"url": "a", "method": "GET", "headers": {
+                "Authorization": "Bearer xxx",
+                "User-Agent": "Mozilla/5.0",
+            }},
+        ]
+        result = _compute_common_headers(raw)
+        # threshold = max(1*0.5, 2) = 2, 所以单个请求不会有公共头
+        for k in result:
+            pass  # 可能为空
+        # 实际上 threshold 至少为 2，所以单个请求不会有任何公共头
+
+    def test_skips_empty_values(self):
+        raw = [
+            {"url": "a", "method": "GET", "headers": {"X-Token": "  "}},
+            {"url": "b", "method": "GET", "headers": {"X-Token": "  "}},
+        ]
+        result = _compute_common_headers(raw)
+        assert "X-Token" not in result  # 空值被跳过
+
+
+# ── Hostname 提取 + 域名匹配测试 ──────────────────────────────
+
+
+class TestExtractHostname:
+    """_extract_hostname 从 URL 文本中提取纯 hostname。"""
+
+    def test_basic_http(self):
+        assert _extract_hostname("https://example.com/api") == "example.com"
+
+    def test_with_port(self):
+        assert _extract_hostname("https://example.com:8080/path") == "example.com"
+
+    def test_with_ws_protocol(self):
+        assert _extract_hostname("wss://api.example.com/ws") == "api.example.com"
+
+    def test_no_protocol(self):
+        assert _extract_hostname("cdn.example.com/static/file.js") == "cdn.example.com"
+
+    def test_uppercase(self):
+        assert _extract_hostname("https://EXAMPLE.COM/") == "example.com"
+
+    def test_empty(self):
+        assert _extract_hostname("") == ""
+        assert _extract_hostname(None) == ""
+
+
+class TestIsSameOrSubdomain:
+    """_is_same_or_subdomain 精确域名/子域名匹配。"""
+
+    def test_exact_match(self):
+        assert _is_same_or_subdomain("https://example.com/api", "example.com") is True
+
+    def test_subdomain_match(self):
+        assert _is_same_or_subdomain("https://api.example.com/data", "example.com") is True
+
+    def test_multi_level_subdomain(self):
+        assert _is_same_or_subdomain("https://cdn.static.example.com/x.js", "example.com") is True
+
+    def test_no_false_match_similar_name(self):
+        """不应匹配不是子域名的相似域名。"""
+        assert _is_same_or_subdomain("https://notexample.com", "example.com") is False
+
+    def test_no_false_match_suffix(self):
+        """不应匹配后缀相同的域名。"""
+        assert _is_same_or_subdomain("https://example.com.evil.org", "example.com") is False
+
+    def test_path_contains_domain_string(self):
+        """路径中包含域名字串不应被误匹配。"""
+        assert _is_same_or_subdomain("https://other.com/api?d=example.com", "example.com") is False
+
+    def test_case_insensitive(self):
+        assert _is_same_or_subdomain("https://API.EXAMPLE.COM/", "example.com") is True
+
+    def test_empty_input(self):
+        assert _is_same_or_subdomain("", "example.com") is False

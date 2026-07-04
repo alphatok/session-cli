@@ -25,6 +25,7 @@ from typing import Optional, Dict
 
 from core.mcp import (
     _start_mcp_server,
+    _launch_temp_chrome,
     _grab_cookies_impl,
     _jsonrpc_send,
 )
@@ -46,6 +47,8 @@ class McpManager:
         self._idle_timeout: float = 600.0  # 10 分钟
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_running: bool = False
+        self._browser_mode: str = "user"  # "user" | "temp"
+        self._temp_chrome_proc: Optional[any] = None  # 临时 Chrome 进程
 
     @classmethod
     def get_instance(cls) -> "McpManager":
@@ -58,8 +61,12 @@ class McpManager:
 
     # ── 连接管理 ──────────────────────────────────────────────
 
-    def connect(self) -> bool:
+    def connect(self, browser_mode: str = "user") -> bool:
         """启动 MCP 进程并完成初始化握手 + CDP 健康检查。
+
+        Args:
+            browser_mode: "user" 使用用户已登录的浏览器（autoConnect），
+                          "temp" 启动临时 Chrome 实例
 
         Returns:
             True 表示连接成功
@@ -72,10 +79,17 @@ class McpManager:
             if self._proc is not None:
                 self._disconnect_internal()
 
+            self._browser_mode = browser_mode
+
             try:
-                self._proc = _start_mcp_server(auto_connect=True)
+                if browser_mode == "temp":
+                    self._temp_chrome_proc = _launch_temp_chrome()
+                    self._proc = _start_mcp_server(auto_connect=False, browser_url="http://127.0.0.1:9222")
+                else:
+                    self._proc = _start_mcp_server(auto_connect=True)
             except RuntimeError as e:
                 self._proc = None
+                self._temp_chrome_proc = None
                 raise RuntimeError(f"MCP 连接失败: {e}") from e
 
             now = time.time()
@@ -120,6 +134,18 @@ class McpManager:
         self._last_activity = 0.0
         self._connected_at = 0.0
 
+        # 清理临时 Chrome 进程
+        if self._temp_chrome_proc is not None:
+            try:
+                self._temp_chrome_proc.terminate()
+                self._temp_chrome_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._temp_chrome_proc.kill()
+                except Exception:
+                    pass
+            self._temp_chrome_proc = None
+
     def ensure_connected(self):
         """确保 MCP 已连接且 CDP 通信正常（幂等操作）。
 
@@ -127,7 +153,7 @@ class McpManager:
             RuntimeError: 连接失败或 CDP 不可用
         """
         if not self.is_connected():
-            self.connect()
+            self.connect(browser_mode=self._browser_mode)
         else:
             # 连接存在但验证 CDP 是否可达
             ok, msg = self.health_check()
@@ -135,7 +161,7 @@ class McpManager:
                 # CDP 断开了，重连
                 with self._comm_lock:
                     self._disconnect_internal()
-                self.connect()
+                self.connect(browser_mode=self._browser_mode)
 
     # ── 状态查询 ──────────────────────────────────────────────
 
@@ -176,6 +202,7 @@ class McpManager:
         Returns:
             {
                 "connected": bool,
+                "browser_mode": str,       # "user" | "temp"
                 "idle_seconds": float,    # 距上次操作已过多少秒
                 "uptime_seconds": float,   # 本次连接已持续多少秒（未连接时为 0）
                 "timeout_seconds": float,  # 空闲超时阈值（秒）
@@ -185,10 +212,15 @@ class McpManager:
         connected = self.is_connected()
         return {
             "connected": connected,
+            "browser_mode": self._browser_mode,
             "idle_seconds": round(now - self._last_activity, 1) if connected else 0,
             "uptime_seconds": round(now - self._connected_at, 1) if connected else 0,
             "timeout_seconds": self._idle_timeout,
         }
+
+    def set_browser_mode(self, mode: str):
+        """设置浏览器模式（需在断开状态下调用）。"""
+        self._browser_mode = mode
 
     # ── 活动追踪 ──────────────────────────────────────────────
 
@@ -253,7 +285,7 @@ def grab_cookies_managed(
     与 mcp.grab_cookies() 返回相同格式，但使用长连接复用 MCP 进程。
 
     Args:
-        domain: 目标域名
+        domain: 目标域名或完整 URL，如 "yuanbao.tencent.com" 或 "https://example.com/path"
         on_progress: 可选回调 (stage, detail)
         cancel_event: 可选 threading.Event，外部 set 后取消本次抓取
         timeout: 整体操作超时（秒），默认 60 秒。超时后通过 cancel_event 中断
@@ -289,10 +321,12 @@ def grab_cookies_managed(
             if proc is None:
                 raise RuntimeError("MCP 进程不可用")
 
-            # 清理域名
-            domain = domain.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
+            # 提取纯 domain + 构建导航 URL
+            raw_input = domain.strip()
+            clean_domain = raw_input.lower().replace("https://", "").replace("http://", "").split("/")[0]
+            navigate_url = raw_input if raw_input.startswith("http") else f"https://{clean_domain}"
 
-            result = _grab_cookies_impl(proc, domain, on_progress=on_progress, cancel_event=_cancel_event)
+            result = _grab_cookies_impl(proc, clean_domain, on_progress=on_progress, cancel_event=_cancel_event, url=navigate_url)
             mgr._bump_activity()
             return result
     except Exception:

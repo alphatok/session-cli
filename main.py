@@ -52,12 +52,16 @@ def cmd_grab(domain: str, auto_connect: bool):
 
     cookies = data.get("cookies", {})
     auth_tokens = data.get("auth_tokens", [])
+    headers = data.get("headers", {})
+    raw_requests = data.get("raw_requests", [])
+    related_domains = data.get("related_domains", [])
 
-    if not cookies and not auth_tokens:
-        print("[✗] 未获取到 Cookie 和认证凭据")
+    if not cookies and not auth_tokens and not headers:
+        print("[✗] 未获取到 Cookie、认证凭据或请求头")
         sys.exit(1)
 
-    print(f"[✓] 获取到 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据")
+    rel_msg = f", {len(related_domains)} 个关联域名" if related_domains else ""
+    print(f"[✓] 获取到 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据, {len(headers)} 个公共 Header, {len(raw_requests)} 个原始请求{rel_msg}")
     info = core.store_site(domain, data)
     print(f"[✓] 已存储到 vault: {info}")
 
@@ -68,19 +72,49 @@ def cmd_get(domain: str):
         print(f"[✗] 未找到 {domain}")
         sys.exit(1)
     status = "⚠ 已过期" if site["expired"] else "✓"
-    print(f"[{status}] {site['domain']} | {site['cookie_count']} cookies | {site.get('auth_token_count', 0)} 认证凭据")
+    hdr_count = site.get("header_count", 0)
+    raw_count = site.get("raw_request_count", 0)
+    print(f"[{status}] {site['domain']} | {site['cookie_count']} cookies | {site.get('auth_token_count', 0)} 认证凭据 | {hdr_count} headers | {raw_count} 原始请求")
     print(f"  创建: {site['created_at']}  过期: {site['expires_at']}")
-    print("\nCookie 列表:")
-    for name, value in site["cookies"].items():
-        dv = value[:30] + "..." if len(value) > 30 else value
-        print(f"  {name} = {dv}")
 
+    # Cookie 列表
+    if site["cookies"]:
+        print("\nCookie 列表:")
+        for name, value in site["cookies"].items():
+            dv = value[:30] + "..." if len(value) > 30 else value
+            print(f"  {name} = {dv}")
+
+    # 认证凭据
     auth_tokens = site.get("auth_tokens", [])
     if auth_tokens:
         print("\n认证凭据 (Authorization Headers):")
         for t in auth_tokens:
             tv = t["value"][:50] + "..." if len(t["value"]) > 50 else t["value"]
             print(f"  [{t['source']}] {t['key']} = {tv}")
+
+    # 公共 Request Headers
+    headers = site.get("headers", {})
+    if headers:
+        print(f"\n公共 Request Headers ({len(headers)} 个):")
+        for key, value in headers.items():
+            dv = value[:60] + "..." if len(value) > 60 else value
+            print(f"  {key}: {dv}")
+
+    # 原始请求列表摘要
+    raw_requests = site.get("raw_requests", [])
+    if raw_requests:
+        print(f"\n原始请求列表 ({len(raw_requests)} 条):")
+        for i, req in enumerate(raw_requests[:5], 1):
+            print(f"  {i}. [{req.get('method', 'GET')}] {req.get('url', '')[:80]}")
+        if len(raw_requests) > 5:
+            print(f"  ... 还有 {len(raw_requests) - 5} 条")
+
+    # 关联域名
+    related_domains = site.get("related_domains", [])
+    if related_domains:
+        print(f"\n关联域名 ({len(related_domains)} 个):")
+        for d in related_domains:
+            print(f"  {d}")
 
 
 def cmd_list():
@@ -92,8 +126,12 @@ def cmd_list():
     for s in sites:
         tag = "✗ 已过期" if s["expired"] else "✓"
         at_count = s.get("auth_token_count", 0)
+        hdr_count = s.get("header_count", 0)
         at_str = f", {at_count} 凭据" if at_count else ""
-        print(f"  [{tag}] {s['domain']}  ({s['cookie_count']} cookies{at_str})")
+        hdr_str = f", {hdr_count} headers" if hdr_count else ""
+        rel_count = s.get("related_domain_count", 0)
+        rel_str = f", {rel_count} 关联域" if rel_count else ""
+        print(f"  [{tag}] {s['domain']}  ({s['cookie_count']} cookies{at_str}{hdr_str}{rel_str})")
 
 
 def cmd_delete(domain: str):

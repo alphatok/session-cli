@@ -200,8 +200,8 @@ class TestMcpManagerCommLock:
     def test_comm_lock_is_threading_lock(self):
         """_comm_lock 是 threading.RLock 实例。"""
         mgr = McpManager.get_instance()
-        from threading import RLock
-        assert isinstance(mgr._comm_lock, RLock)
+        lock_type_name = type(mgr._comm_lock).__name__
+        assert lock_type_name == "RLock"
 
     def test_acquire_comm_lock_returns_same_lock(self):
         """acquire_comm_lock 返回正确的锁。"""

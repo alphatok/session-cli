@@ -11,12 +11,13 @@ Session CRUD — 站点 Cookie 的存储、查询、删除。
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from core.vault import get_vault, utcnow
 from core.mcp import grab_cookies as _grab_cookies_via_mcp  # re-export alias
-from core.mcp import AUTH_PREFIX
+from core.mcp import AUTH_PREFIX, HDR_PREFIX, RAW_PREFIX, REL_PREFIX
 
 
 # ── 凭据编码/解码辅助 -------------------------------------------------
@@ -61,6 +62,91 @@ def _decode_auth_tokens(cookies: Dict[str, str]) -> tuple[Dict[str, str], List[d
     return pure, auth_tokens
 
 
+def _encode_headers(
+    headers: Dict[str, str],
+    raw_requests: List[dict],
+) -> Dict[str, str]:
+    """将公共 Header 和 raw_requests 编码合并到 cookies 风格的 dict 中。
+
+    编码规则:
+        __hdr__{HeaderName} = {HeaderValue}          — 公共 Header
+        __raw__requests = JSON字符串                   — 原始请求列表
+
+    Args:
+        headers: 公共 Request Header 字典 {key: value}
+        raw_requests: 原始请求列表 [{url, method, headers: {key: value}}]
+
+    Returns:
+        编码后的 dict（可合并到主 cookies dict）
+    """
+    encoded: Dict[str, str] = {}
+    for key, value in headers.items():
+        encoded[f"{HDR_PREFIX}{key}"] = str(value)
+    if raw_requests:
+        encoded[f"{RAW_PREFIX}requests"] = json.dumps(raw_requests, ensure_ascii=False)
+    return encoded
+
+
+def _decode_headers(
+    cookies: Dict[str, str],
+) -> tuple[Dict[str, str], List[dict]]:
+    """从 cookies dict 中分离出公共 Header 和 raw_requests。
+
+    Returns:
+        (headers: {key: value}, raw_requests: [{url, method, headers}])
+    """
+    headers: Dict[str, str] = {}
+    raw_requests: List[dict] = []
+    raw_key = f"{RAW_PREFIX}requests"
+
+    for key, value in cookies.items():
+        if key == raw_key:
+            try:
+                raw_requests = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif key.startswith(HDR_PREFIX):
+            hdr_name = key[len(HDR_PREFIX):]
+            headers[hdr_name] = value
+
+    return headers, raw_requests
+
+
+def _encode_related(related_domains: List[str]) -> Dict[str, str]:
+    """将关联域名列表编码为 Vault 键值对。
+
+    编码规则:
+        __rel__domains = JSON字符串（去重排序后的域名列表）
+
+    Args:
+        related_domains: 域名字符串列表（可能含重复）
+
+    Returns:
+        编码后的 dict（可合并到主 cookies dict）
+    """
+    # 去重并排序
+    uniq = sorted(set(d for d in related_domains if d))
+    if not uniq:
+        return {}
+    return {f"{REL_PREFIX}domains": json.dumps(uniq, ensure_ascii=False)}
+
+
+def _decode_related(cookies: Dict[str, str]) -> List[str]:
+    """从 cookies dict 中解码关联域名列表。
+
+    Returns:
+        关联域名列表（已去重排序），无数据时返回 []
+    """
+    key = f"{REL_PREFIX}domains"
+    value = cookies.get(key, "")
+    if not value:
+        return []
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 # ── 公共 API ──────────────────────────────────────────────────
 
 
@@ -88,11 +174,16 @@ def list_sites() -> List[dict]:
     for s in sessions:
         raw_cookies = s.cookies if isinstance(s.cookies, dict) else {}
         pure_cookies, auth_tokens = _decode_auth_tokens(raw_cookies)
+        headers, raw_requests = _decode_headers(raw_cookies)
+        related_domains = _decode_related(raw_cookies)
         expired = s.expires_at.replace(tzinfo=None) <= now.replace(tzinfo=None)
         result.append({
             "domain": s.domain,
             "cookie_count": len(pure_cookies),
             "auth_token_count": len(auth_tokens),
+            "header_count": len(headers),
+            "raw_request_count": len(raw_requests),
+            "related_domain_count": len(related_domains),
             "created_at": s.created_at.isoformat(),
             "expires_at": s.expires_at.isoformat(),
             "expired": expired,
@@ -108,6 +199,8 @@ def get_site(domain: str) -> Optional[dict]:
         return None
     raw_cookies = session.cookies if isinstance(session.cookies, dict) else {}
     pure_cookies, auth_tokens = _decode_auth_tokens(raw_cookies)
+    headers, raw_requests = _decode_headers(raw_cookies)
+    related_domains = _decode_related(raw_cookies)
     now = utcnow()
     expired = session.expires_at.replace(tzinfo=None) <= now.replace(tzinfo=None)
     return {
@@ -116,6 +209,12 @@ def get_site(domain: str) -> Optional[dict]:
         "cookie_count": len(pure_cookies),
         "auth_tokens": auth_tokens,
         "auth_token_count": len(auth_tokens),
+        "headers": headers,
+        "header_count": len(headers),
+        "raw_requests": raw_requests,
+        "raw_request_count": len(raw_requests),
+        "related_domains": related_domains,
+        "related_domain_count": len(related_domains),
         "created_at": session.created_at.isoformat(),
         "expires_at": session.expires_at.isoformat(),
         "expired": expired,
@@ -134,7 +233,14 @@ def store_site(domain: str, data: dict) -> dict:
     """
     cookies = data.get("cookies", {})
     auth_tokens = data.get("auth_tokens", [])
+    headers = data.get("headers", {})
+    raw_requests = data.get("raw_requests", [])
+    related_domains = data.get("related_domains", [])
+
+    # 合并 Cookie + Auth Tokens + Headers + Raw Requests + Related Domains
     merged = _encode_auth_tokens(cookies, auth_tokens)
+    merged.update(_encode_headers(headers, raw_requests))
+    merged.update(_encode_related(related_domains))
 
     vault = get_vault()
     vault.store_session(
@@ -146,6 +252,9 @@ def store_site(domain: str, data: dict) -> dict:
         "domain": domain,
         "cookie_count": len(cookies),
         "auth_token_count": len(auth_tokens),
+        "header_count": len(headers),
+        "raw_request_count": len(raw_requests),
+        "related_domain_count": len(related_domains),
     }
 
 
