@@ -55,7 +55,7 @@ def sample_session_rows():
 
     s1 = MagicMock()
     s1.domain = "example.com"
-    s1.cookies = {"token": "abc123", "session": "xyz789"}
+    s1.cookies = {"token": "abc123", "session": "xyz789", "__auth__ls:auth_token": "Bearer eyJ..."}
     s1.created_at = datetime(2026, 1, 1, 12, 0)
     s1.expires_at = datetime(2026, 12, 31, 12, 0)
     s1.id = "uuid-1"
@@ -99,10 +99,47 @@ def sample_mcp_page_list():
 
 @pytest.fixture
 def sample_mcp_cookie_result():
-    """模拟 evaluate_script 的 Markdown 返回。"""
+    """模拟旧版 evaluate_script 的 Markdown 返回（name=value 字符串）。"""
     return (
         "Script ran on page and returned:\n"
         '```json\n'
         '"token=abc123; session=xyz789; uid=user001"\n'
         '```'
     )
+
+
+@pytest.fixture
+def sample_mcp_grab_json():
+    """模拟新版 evaluate_script 的增强 JS 返回（JSON 对象）。"""
+    return (
+        "Script ran on page and returned:\n"
+        "```json\n"
+        '{"cookies":[{"name":"token","value":"abc123"},{"name":"session","value":"xyz789"}],'
+        '"storage":{"localStorage":{"auth_token":"Bearer eyJhbGciOiJIUzI1NiJ9.xxx","refresh_token":"rt_abc123"},'
+        '"sessionStorage":{}}}'
+        "\n```"
+    )
+
+
+@pytest.fixture
+def sample_grab_enriched():
+    """模拟 grab_cookies 的增强返回结构。"""
+    return {
+        "cookies": {"token": "abc123", "session": "xyz789"},
+        "auth_tokens": [
+            {"source": "localStorage", "key": "auth_token", "value": "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"},
+            {"source": "localStorage", "key": "refresh_token", "value": "rt_abc123"},
+        ],
+    }
+
+
+@pytest.fixture
+def sample_auth_encoded_cookies():
+    """模拟编码后的 cookies dict（含 __auth__ 前缀凭据）。"""
+    return {
+        "token": "abc123",
+        "session": "xyz789",
+        "__auth__ls:auth_token": "Bearer eyJhbGciOiJIUzI1NiJ9.xxx",
+        "__auth__ls:refresh_token": "rt_abc123",
+        "__auth__ss:session_id": "sess_456",
+    }

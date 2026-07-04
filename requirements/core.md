@@ -6,9 +6,10 @@
 |----|--------|-------------|
 | REQ-001 | ✅ | Connect to Chrome DevTools via MCP protocol (`@anthropic/chrome-devtools-mcp`) |
 | REQ-002 | ✅ | Auto-connect to running Chrome instance via `chrome://inspect/#remote-debugging` |
-| REQ-003 | ✅ | Extract cookies for a given domain (name, value, domain, path, httpOnly, secure, sameSite, expires) |
+| REQ-003 | 🚧 | Extract cookies for a given domain (name, value, domain, path, httpOnly, secure, sameSite, expires). Note: Currently limited to name/value via `document.cookie`. Full attributes require CDP `Network.getCookies` — pending chrome-devtools-mcp enhancement. |
 | REQ-004 | ✅ | Support `--auto-connect` flag to skip manual port entry |
 | REQ-005 | 📋 | Support Firefox and Edge MCP adapters |
+| REQ-005a | ✅ | Scan localStorage/sessionStorage for auth tokens (token, auth, jwt, bearer, access_token, refresh_token, etc.) during grab, store encoded with `__auth__` prefix |
 
 ## Vault Storage (`core/vault.py`)
 

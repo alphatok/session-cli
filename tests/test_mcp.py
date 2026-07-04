@@ -10,6 +10,7 @@ import pytest
 
 from core.mcp import (
     _extract_markdown_json,
+    _extract_markdown_json_obj,
     _extract_result,
     _find_npx,
     _jsonrpc_send,
@@ -161,32 +162,91 @@ class TestExtractMarkdownJson:
         assert _extract_markdown_json(42) == ""
 
 
+class TestExtractMarkdownJsonObj:
+    """增强版 Markdown JSON 对象提取（v2 新增）。"""
+
+    def test_extracts_json_object(self, sample_mcp_grab_json):
+        """从 Markdown 中提取 JSON 对象。"""
+        result = _extract_markdown_json_obj(sample_mcp_grab_json)
+        assert result is not None
+        assert "cookies" in result
+        assert len(result["cookies"]) == 2
+        assert result["cookies"][0]["name"] == "token"
+        assert result["cookies"][0]["value"] == "abc123"
+        assert result["storage"]["localStorage"]["auth_token"] == "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"
+
+    def test_parses_auth_tokens(self, sample_mcp_grab_json):
+        """auth_token 从 localStorage 正确提取。"""
+        result = _extract_markdown_json_obj(sample_mcp_grab_json)
+        assert "refresh_token" in result["storage"]["localStorage"]
+        assert result["storage"]["localStorage"]["refresh_token"] == "rt_abc123"
+
+    def test_json_without_language_tag(self):
+        """无 json 语言标记的 code block 也可解析。"""
+        text = '```\n{"cookies":[{"name":"a","value":"1"}]}\n```'
+        result = _extract_markdown_json_obj(text)
+        assert result is not None
+        assert result["cookies"][0]["name"] == "a"
+
+    def test_empty_storage(self):
+        """空 localStorage/sessionStorage 返回空 dict。"""
+        text = '```json\n{"cookies":[],"storage":{"localStorage":{},"sessionStorage":{}}}\n```'
+        result = _extract_markdown_json_obj(text)
+        assert result is not None
+        assert result["storage"]["localStorage"] == {}
+
+    def test_falls_back_to_regex_pattern(self):
+        """非标准格式的回退解析（策略 3/4）。"""
+        text = 'Some prefix text {"cookies":[{"name":"x","value":"y"}]} some suffix'
+        result = _extract_markdown_json_obj(text)
+        assert result is not None
+        assert result["cookies"][0]["name"] == "x"
+
+    def test_non_string_returns_none(self):
+        assert _extract_markdown_json_obj(None) is None
+        assert _extract_markdown_json_obj(42) is None
+
+    def test_invalid_json_returns_none(self):
+        assert _extract_markdown_json_obj("not json at all") is None
+        assert _extract_markdown_json_obj("```json\n{invalid}\n```") is None
+
+
 class TestGrabCookiesIntegration:
-    """grab_cookies 流程测试（带 mock subprocess）。"""
+    """grab_cookies 流程测试（mock _jsonrpc_send 直接返回预设响应）。"""
 
     @patch("core.mcp._start_mcp_server")
     @patch("core.mcp.time.sleep", return_value=None)
-    def test_full_grab_flow(self, mock_sleep, mock_start, mock_subprocess,
-                            sample_mcp_page_list, sample_mcp_cookie_result):
-        """完整抓取流程：list → select → evaluate → parse。"""
+    def test_full_grab_flow(self, mock_sleep, mock_start, mock_subprocess):
+        """完整抓取流程：list → select/navigate → evaluate → parse。"""
         mock_start.return_value = mock_subprocess
 
-        call_count = 0
+        # 直接 mock _jsonrpc_send 返回预设响应，避免 ID 匹配复杂性
+        list_text = (
+            "## Pages\n"
+            "1: https://other.site.com [selected]\n"
+            "2: https://test.example.com/dashboard\n"
+        )
+        cookie_text = (
+            'Script ran on page and returned:\n'
+            '```json\n'
+            '{"cookies":[{"name":"token","value":"abc"},{"name":"uid","value":"123"}],'
+            '"storage":{"localStorage":{"auth_key":"secret123"},"sessionStorage":{}}}'
+            '\n```'
+        )
 
-        def mock_readline():
-            nonlocal call_count
-            call_count += 1
-            return json.dumps({"jsonrpc": "2.0", "id": 1234567890000, "result": {
-                "content": [{"type": "text", "text": str(call_count)}]
-            }}) + "\n"
-
-        mock_subprocess.stdout.readline = mock_readline
+        # _jsonrpc_send 按调用顺序返回 list → select → evaluate
+        send_responses = [
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": list_text}]}},
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "Switched"}]}},
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": cookie_text}]}},
+        ]
+        send_iter = iter(send_responses)
 
         from core.mcp import grab_cookies
 
         progress_stages = []
 
-        with patch("core.mcp.time.time", return_value=1234567890):
+        with patch("core.mcp._jsonrpc_send", side_effect=lambda *a, **kw: next(send_iter)):
             result = grab_cookies(
                 "test.example.com",
                 auto_connect=False,
@@ -194,5 +254,12 @@ class TestGrabCookiesIntegration:
             )
 
         assert isinstance(result, dict)
+        assert "cookies" in result
+        assert "auth_tokens" in result
+        assert len(result["cookies"]) == 2
+        assert result["cookies"]["token"] == "abc"
+        assert len(result["auth_tokens"]) == 1
+        assert result["auth_tokens"][0]["key"] == "auth_key"
+        assert result["auth_tokens"][0]["source"] == "localStorage"
         for s in ("listing",):
             assert s in progress_stages, f"Missing stage: {s}"

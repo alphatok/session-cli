@@ -45,17 +45,20 @@ def cmd_grab(domain: str, auto_connect: bool):
 
     print(f"[*] 抓取 {domain} ...")
     try:
-        cookies = core.grab_cookies(domain, auto_connect=auto_connect, on_progress=progress)
+        data = core.grab_cookies(domain, auto_connect=auto_connect, on_progress=progress)
     except RuntimeError as e:
         print(f"[✗] {e}")
         sys.exit(1)
 
-    if not cookies:
-        print("[✗] 未获取到 Cookie")
+    cookies = data.get("cookies", {})
+    auth_tokens = data.get("auth_tokens", [])
+
+    if not cookies and not auth_tokens:
+        print("[✗] 未获取到 Cookie 和认证凭据")
         sys.exit(1)
 
-    print(f"[✓] 获取到 {len(cookies)} 个 Cookie")
-    info = core.store_site(domain, cookies)
+    print(f"[✓] 获取到 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据")
+    info = core.store_site(domain, data)
     print(f"[✓] 已存储到 vault: {info}")
 
 
@@ -65,12 +68,19 @@ def cmd_get(domain: str):
         print(f"[✗] 未找到 {domain}")
         sys.exit(1)
     status = "⚠ 已过期" if site["expired"] else "✓"
-    print(f"[{status}] {site['domain']} | {site['cookie_count']} cookies")
+    print(f"[{status}] {site['domain']} | {site['cookie_count']} cookies | {site.get('auth_token_count', 0)} 认证凭据")
     print(f"  创建: {site['created_at']}  过期: {site['expires_at']}")
     print("\nCookie 列表:")
     for name, value in site["cookies"].items():
         dv = value[:30] + "..." if len(value) > 30 else value
         print(f"  {name} = {dv}")
+
+    auth_tokens = site.get("auth_tokens", [])
+    if auth_tokens:
+        print("\n认证凭据 (Authorization Headers):")
+        for t in auth_tokens:
+            tv = t["value"][:50] + "..." if len(t["value"]) > 50 else t["value"]
+            print(f"  [{t['source']}] {t['key']} = {tv}")
 
 
 def cmd_list():
@@ -81,7 +91,9 @@ def cmd_list():
     print(f"已存储 {len(sites)} 个站点:\n")
     for s in sites:
         tag = "✗ 已过期" if s["expired"] else "✓"
-        print(f"  [{tag}] {s['domain']}  ({s['cookie_count']} cookies)")
+        at_count = s.get("auth_token_count", 0)
+        at_str = f", {at_count} 凭据" if at_count else ""
+        print(f"  [{tag}] {s['domain']}  ({s['cookie_count']} cookies{at_str})")
 
 
 def cmd_delete(domain: str):

@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 import core
+from core.mcp_manager import McpManager, grab_cookies_managed
 
 # ── Templates ─────────────────────────────────────────────────
 
@@ -48,20 +49,27 @@ def _cleanup_queue(task_id: str) -> None:
 
 
 def _run_grab_task(task_id: str, domain: str):
-    """后台线程执行 cookie 抓取，通过 queue 汇报进度。"""
+    """后台线程执行 cookie 抓取（通过 McpManager 长连接）。"""
     q = _get_or_create_queue(task_id)
 
     def on_progress(stage, detail):
         q.put(json.dumps({"stage": stage, "detail": detail}))
 
     try:
-        cookies = core.grab_cookies(domain, auto_connect=True, on_progress=on_progress)
-        if not cookies:
-            q.put(json.dumps({"stage": "error", "detail": "未获取到 Cookie，请确认已登录"}))
+        data = grab_cookies_managed(domain, on_progress=on_progress)
+        cookies = data.get("cookies", {})
+        auth_tokens = data.get("auth_tokens", [])
+        if not cookies and not auth_tokens:
+            q.put(json.dumps({"stage": "error", "detail": "未获取到 Cookie 和认证凭据，请确认已登录"}))
             _cleanup_queue(task_id)
             return
-        core.store_site(domain, cookies)
-        q.put(json.dumps({"stage": "completed", "detail": f"成功存储 {len(cookies)} 个 Cookie", "count": len(cookies)}))
+        core.store_site(domain, data)
+        q.put(json.dumps({
+            "stage": "completed",
+            "detail": f"成功存储 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据",
+            "count": len(cookies),
+            "auth_count": len(auth_tokens),
+        }))
     except Exception as e:
         q.put(json.dumps({"stage": "error", "detail": str(e)}))
     finally:
@@ -72,7 +80,7 @@ def _run_grab_task(task_id: str, domain: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动 / 关闭时管理 Vault 生命周期。"""
+    """启动 / 关闭时管理 Vault + MCP 生命周期。"""
     try:
         vault = core.get_vault()
         vault.list_sessions()  # 验证 vault 可用
@@ -81,7 +89,14 @@ async def lifespan(app: FastAPI):
         print(f"[!] Vault 解锁失败: {e}")
         print("[!] 请先执行: uv run python main.py init")
     yield
-    # 清理：关闭所有 SSE 队列
+    # 清理：关闭 MCP 连接 + SSE 队列
+    try:
+        mgr = McpManager.get_instance()
+        if mgr.is_connected():
+            mgr.disconnect()
+            print("[✓] MCP 连接已关闭")
+    except Exception:
+        pass
     with _progress_lock:
         _progress_queues.clear()
 
@@ -160,3 +175,52 @@ async def api_delete_session(domain: str):
     if not ok:
         return JSONResponse({"error": "未找到"}, status_code=404)
     return {"status": "deleted", "domain": domain}
+
+
+@app.post("/api/sessions/{domain}/refresh")
+async def api_refresh_session(domain: str):
+    """立即更新指定站点的 Session（重新抓取并覆盖）。"""
+    import uuid
+
+    try:
+        core.get_vault()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    task_id = uuid.uuid4().hex[:8]
+    thread = threading.Thread(target=_run_grab_task, args=(task_id, domain), daemon=True)
+    thread.start()
+
+    return {"task_id": task_id, "status": "started", "domain": domain}
+
+
+# ── MCP 连接管理 ─────────────────────────────────────────────
+
+@app.get("/api/mcp/status")
+async def api_mcp_status():
+    """获取 MCP 连接状态。"""
+    mgr = McpManager.get_instance()
+    return mgr.get_status()
+
+
+@app.post("/api/mcp/connect")
+async def api_mcp_connect():
+    """手动连接 MCP。"""
+    mgr = McpManager.get_instance()
+    if mgr.is_connected():
+        return {"status": "already_connected"}
+    try:
+        mgr.connect()
+        return {"status": "connected"}
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/mcp/disconnect")
+async def api_mcp_disconnect():
+    """手动断开 MCP。"""
+    mgr = McpManager.get_instance()
+    if not mgr.is_connected():
+        return {"status": "not_connected"}
+    mgr.disconnect()
+    return {"status": "disconnected"}

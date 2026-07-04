@@ -92,6 +92,14 @@
         }
         .detail-name { width: 180px; color: var(--accent); flex-shrink: 0; }
         .detail-value { word-break: break-all; max-width: 400px; }
+        .detail-section-title {
+            font-size: 14px; font-weight: 600; color: var(--orange);
+            margin: 12px 0 6px 0; padding-bottom: 4px; border-bottom: 1px solid var(--border);
+        }
+        .auth-badge {
+            font-size: 10px; padding: 1px 6px; border-radius: 8px;
+            background: var(--orange); color: #000; margin-left: 6px;
+        }
         .empty-state { text-align: center; padding: 40px; color: var(--text-dim); font-size: 14px; }
 
         /* Toast */
@@ -103,6 +111,38 @@
         .toast-success { background: var(--green); color: #000; }
         .toast-error { background: var(--red); color: #fff; }
         @keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
+
+        /* MCP Connection Status */
+        .status-bar {
+            display: flex; align-items: center; gap: 10px;
+            padding: 10px 14px; background: var(--surface);
+            border: 1px solid var(--border); border-radius: var(--radius);
+            margin-bottom: 20px; font-size: 13px;
+        }
+        .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+        .status-dot.disconnected { background: var(--orange); }
+        .status-dot.connecting { background: var(--accent); animation: pulse 1s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .status-label { font-weight: 500; }
+        .status-idle { color: var(--text-dim); font-size: 12px; margin-left: auto; }
+        .btn-outline {
+            padding: 5px 12px; border-radius: var(--radius); font-size: 12px;
+            cursor: pointer; font-weight: 500; border: 1px solid var(--border);
+            color: var(--text-dim); background: transparent; transition: all .2s;
+        }
+        .btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+        .btn-outline.danger:hover { border-color: var(--red); color: var(--red); }
+        .btn-refresh {
+            padding: 6px 10px; border-radius: var(--radius); font-size: 12px;
+            cursor: pointer; background: transparent; border: 1px solid var(--border);
+            color: var(--text-dim); transition: all .2s;
+        }
+        .btn-refresh:hover { border-color: var(--accent); color: var(--accent); background: rgba(88,166,255,0.08); }
+        .btn-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -111,6 +151,15 @@
         🔑 Session Manager
         <span class="badge badge-ok">v1.0</span>
     </h1>
+
+    <!-- ====== MCP 连接状态 ====== -->
+    <div id="mcp-status" class="status-bar">
+        <span class="status-dot disconnected"></span>
+        <span class="status-label">MCP 未连接</span>
+        <button class="btn-outline" onclick="connectMcp()" id="btn-connect">连接</button>
+        <button class="btn-outline danger" onclick="disconnectMcp()" id="btn-disconnect" style="display:none">断开</button>
+        <span class="status-idle" id="status-idle"></span>
+    </div>
 
     <!-- ====== 添加站点 ====== -->
     <div class="card">
@@ -202,6 +251,7 @@ function listenProgress(taskId) {
                 progress.classList.remove('active');
                 htmx.trigger('#session-list', 'refresh-sessions');
                 showToast(data.detail, 'success');
+                updateMcpStatus();  // 刷新 MCP 状态
             }, 800);
             currentEventSource.close();
         }
@@ -244,11 +294,30 @@ function toggleDetail(encodedDomain) {
         fetch(`/api/sessions/${encodeURIComponent(originalDomain)}`)
             .then(r => r.json())
             .then(site => {
-                let html = '<div class="card" style="margin-top:10px"><h3>Cookie 详情</h3>';
-                for (const [k, v] of Object.entries(site.cookies || {})) {
-                    const dv = v.length > 50 ? v.slice(0, 50) + '...' : v;
-                    html += `<div class="detail-row"><span class="detail-name">${escHtml(k)}</span><span class="detail-value">${escHtml(dv)}</span></div>`;
+                let html = '<div class="card" style="margin-top:10px">';
+
+                // Cookie 区域
+                html += '<h3>Cookie 详情</h3>';
+                const cookies = site.cookies || {};
+                if (Object.keys(cookies).length === 0) {
+                    html += '<div class="empty-state" style="padding:10px">无 Cookie</div>';
+                } else {
+                    for (const [k, v] of Object.entries(cookies)) {
+                        const dv = v.length > 50 ? v.slice(0, 50) + '...' : v;
+                        html += `<div class="detail-row"><span class="detail-name">${escHtml(k)}</span><span class="detail-value">${escHtml(dv)}</span></div>`;
+                    }
                 }
+
+                // 认证凭据区域
+                const authTokens = site.auth_tokens || [];
+                if (authTokens.length > 0) {
+                    html += `<div class="detail-section-title">🔐 认证凭据 <span class="auth-badge">${authTokens.length}</span></div>`;
+                    for (const t of authTokens) {
+                        const tv = t.value.length > 80 ? t.value.slice(0, 80) + '...' : t.value;
+                        html += `<div class="detail-row"><span class="detail-name">${escHtml(t.key)} <small style="color:var(--text-dim)">[${t.source}]</small></span><span class="detail-value" style="max-width:350px">${escHtml(tv)}</span></div>`;
+                    }
+                }
+
                 html += '</div>';
                 el.innerHTML = html;
                 el.style.display = 'block';
@@ -269,6 +338,173 @@ function showToast(msg, type) {
     document.body.appendChild(t);
     setTimeout(() => t.remove(), 3000);
 }
+
+// ── MCP 连接状态管理 ──────────────────────────────────────
+
+let mcpPollInterval = null;
+
+function pollMcpStatus() {
+    if (mcpPollInterval) clearInterval(mcpPollInterval);
+    mcpPollInterval = setInterval(updateMcpStatus, 3000);
+    updateMcpStatus();
+}
+
+function updateMcpStatus() {
+    fetch('/api/mcp/status')
+        .then(r => r.json())
+        .then(data => {
+            const dot = document.querySelector('#mcp-status .status-dot');
+            const label = document.querySelector('#mcp-status .status-label');
+            const btnConnect = document.getElementById('btn-connect');
+            const btnDisconnect = document.getElementById('btn-disconnect');
+            const idleEl = document.getElementById('status-idle');
+
+            dot.className = 'status-dot';
+            if (data.connected) {
+                dot.classList.add('connected');
+                label.textContent = 'MCP 已连接';
+                btnConnect.style.display = 'none';
+                btnDisconnect.style.display = '';
+                const mins = Math.floor(data.idle_seconds / 60);
+                const secs = Math.floor(data.idle_seconds % 60);
+                idleEl.textContent = mins > 0 ? `空闲 ${mins}m${secs}s` : `空闲 ${secs}s`;
+            } else {
+                dot.classList.add('disconnected');
+                label.textContent = 'MCP 未连接';
+                btnConnect.style.display = '';
+                btnDisconnect.style.display = 'none';
+                idleEl.textContent = '';
+            }
+        })
+        .catch(() => {}); // 服务器未启动时静默失败
+}
+
+function connectMcp() {
+    const dot = document.querySelector('#mcp-status .status-dot');
+    const label = document.querySelector('#mcp-status .status-label');
+    dot.className = 'status-dot connecting';
+    label.textContent = '连接中...';
+
+    fetch('/api/mcp/connect', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.status === 'connected' || data.status === 'already_connected') {
+                showToast('MCP 已连接', 'success');
+                updateMcpStatus();
+            } else if (data.error) {
+                showToast('连接失败: ' + data.error, 'error');
+                dot.className = 'status-dot disconnected';
+                label.textContent = 'MCP 未连接';
+            }
+        })
+        .catch(e => {
+            showToast('连接失败: ' + e.message, 'error');
+            dot.className = 'status-dot disconnected';
+            label.textContent = 'MCP 未连接';
+        });
+}
+
+function disconnectMcp() {
+    fetch('/api/mcp/disconnect', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            showToast('MCP 已断开', 'success');
+            updateMcpStatus();
+        });
+}
+
+// ── 站点立即更新 ──────────────────────────────────────────
+
+function refreshSession(domain) {
+    const encDom = encodeURIComponent(domain);
+    const btn = document.getElementById('refresh-btn-' + encDom);
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '更新中...';
+    }
+
+    const progress = document.getElementById('progress');
+    const progressText = document.getElementById('progress-text');
+    const progressFill = document.getElementById('progress-fill');
+    progress.classList.add('active');
+    progressText.textContent = '正在更新 ' + domain + ' ...';
+    progressFill.style.width = '0%';
+
+    if (currentEventSource) currentEventSource.close();
+
+    fetch(`/api/sessions/${encodeURIComponent(domain)}/refresh`, { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                showToast(data.error, 'error');
+                progress.classList.remove('active');
+                if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+                return;
+            }
+            currentTaskId = data.task_id;
+            listenProgressRef(data.task_id, domain);
+        })
+        .catch(e => {
+            showToast('更新失败: ' + e.message, 'error');
+            progress.classList.remove('active');
+            if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+        });
+}
+
+function listenProgressRef(taskId, domain) {
+    const progressText = document.getElementById('progress-text');
+    const progressFill = document.getElementById('progress-fill');
+    const progress = document.getElementById('progress');
+    const encDom = encodeURIComponent(domain);
+    const btn = document.getElementById('refresh-btn-' + encDom);
+
+    const stages = { waiting: 15, listing: 30, found: 45, selecting: 50, navigating: 55, evaluating: 80, done: 95 };
+
+    currentEventSource = new EventSource(`/api/sessions/grab/progress?task_id=${taskId}`);
+
+    currentEventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        progressText.textContent = data.detail;
+        const pct = stages[data.stage] || 50;
+        progressFill.style.width = pct + '%';
+
+        if (data.stage === 'completed') {
+            progressFill.style.width = '100%';
+            progressText.textContent = data.detail;
+            setTimeout(() => {
+                progress.classList.remove('active');
+                htmx.trigger('#session-list', 'refresh-sessions');
+                showToast(domain + ' 更新完成', 'success');
+                if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+                // 更新 MCP 状态（idle 计时会重置）
+                updateMcpStatus();
+            }, 800);
+            currentEventSource.close();
+        }
+        if (data.stage === 'error') {
+            progressFill.style.background = 'var(--red)';
+            progressText.textContent = '✗ ' + data.detail;
+            setTimeout(() => {
+                progress.classList.remove('active');
+                progressFill.style.background = 'var(--accent)';
+                if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+            }, 3000);
+            showToast(data.detail, 'error');
+            currentEventSource.close();
+        }
+    };
+
+    currentEventSource.onerror = () => {
+        if (currentEventSource.readyState === EventSource.CLOSED) {
+            progress.classList.remove('active');
+            if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+        }
+    };
+}
+
+// ── 初始化 ────────────────────────────────────────────────
+
+pollMcpStatus();
 </script>
 
 <!-- Server-side rendered session list (fallback) -->
@@ -291,15 +527,18 @@ document.body.addEventListener('htmx:beforeSwap', function(evt) {
                     const tag = s.expired
                         ? '<span class="session-tag tag-expired">已过期</span>'
                         : '<span class="session-tag tag-active">可用</span>';
+                    const atInfo = s.auth_token_count ? ` · ${s.auth_token_count} 凭据` : '';
+                    const encDom = encodeURIComponent(s.domain);
                     html += `
                     <div class="session-item">
                         <span class="session-icon">🌐</span>
                         <div class="session-info">
                             <div class="session-domain">${escHtml(s.domain)} ${tag}</div>
-                            <div class="session-meta">${s.cookie_count} 个 Cookie · 过期 ${s.expires_at.slice(0, 10)}</div>
+                            <div class="session-meta">${s.cookie_count} 个 Cookie${atInfo} · 过期 ${s.expires_at.slice(0, 10)}</div>
                         </div>
                         <div class="session-actions">
-                            <button class="btn btn-sm btn-primary" onclick="toggleDetail('${encodeURIComponent(s.domain)}')">查看</button>
+                            <button class="btn btn-sm btn-refresh" onclick="refreshSession('${escHtml(s.domain)}')" id="refresh-btn-${encDom}">更新</button>
+                            <button class="btn btn-sm btn-primary" onclick="toggleDetail('${encDom}')">查看</button>
                             <button class="btn btn-sm btn-danger" onclick="deleteSession('${escHtml(s.domain)}')">删除</button>
                         </div>
                     </div>
