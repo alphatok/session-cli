@@ -643,7 +643,7 @@ def _grab_network_headers(
 
     progress("network_done", f"捕获 {len(raw_requests)} 个原始请求, {len(related_domains)} 个关联域名")
 
-    return {}, raw_requests, related_domains
+    return _compute_common_headers(raw_requests), raw_requests, related_domains
 
 
 # ── 增强版 Cookie + 凭据采集 JS 脚本 ───────────────────────────

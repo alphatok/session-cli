@@ -182,6 +182,7 @@
         }
         .detail-name { width: 200px; color: var(--accent); flex-shrink: 0; font-weight: 500; }
         .detail-value { word-break: break-all; white-space: pre-wrap; flex: 1; min-width: 0; }
+        .detail-row-auth .detail-name { width: 400px; }
         .detail-section-title {
             font-size: 14px; font-weight: 600; color: var(--orange);
             margin: 14px 0 8px 0; padding-bottom: 6px; border-bottom: 1px solid var(--border);
@@ -335,6 +336,48 @@
         .log-body::-webkit-scrollbar-track { background: transparent; }
         .log-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
         .log-body::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
+
+        /* Value popup */
+        .value-popup-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5); z-index: 9999;
+            display: flex; align-items: center; justify-content: center;
+            animation: fadeIn 0.2s ease;
+        }
+        .value-popup-box {
+            background: var(--surface); border: 1px solid var(--border-light);
+            border-radius: 12px; padding: 24px; max-width: 900px; width: 90%;
+            max-height: 80vh; overflow-y: auto; box-shadow: var(--shadow-lg);
+            animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .value-popup-box .popup-value {
+            font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+            font-size: 13px; line-height: 1.6; word-break: break-all;
+            white-space: pre-wrap; color: var(--text);
+            background: var(--bg); padding: 14px; border-radius: 8px;
+            border: 1px solid var(--border); margin: 12px 0;
+        }
+        .value-popup-box .popup-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 8px;
+        }
+        .value-popup-box .popup-close {
+            background: none; border: 1px solid var(--border); color: var(--text-dim);
+            padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+            transition: all var(--transition-fast);
+        }
+        .value-popup-box .popup-close:hover {
+            background: var(--surface-hover); color: var(--text);
+        }
+        .detail-value-clickable {
+            cursor: pointer; border-bottom: 1px dashed var(--accent);
+            transition: all var(--transition-fast);
+        }
+        .detail-value-clickable:hover { opacity: 0.7; }
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
     </style>
 </head>
 <body>
@@ -557,6 +600,41 @@ function domainToId(domain) {
     return 'detail-' + encodeURIComponent(domain);
 }
 
+function showValuePopup(label, fullValue) {
+    const overlay = document.createElement('div');
+    overlay.className = 'value-popup-overlay';
+    overlay.innerHTML = `<div class="value-popup-box">
+        <div class="popup-header">
+            <span style="color:var(--accent);font-weight:600">${escHtml(label)}</span>
+            <button class="popup-close" onclick="this.closest('.value-popup-overlay').remove()">关闭</button>
+        </div>
+        <div class="popup-value">${escHtml(fullValue)}</div>
+    </div>`;
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.remove();
+    });
+    document.body.appendChild(overlay);
+}
+
+function truncateValue(value, maxLen) {
+    if (!value) return '';
+    return value.length > maxLen ? value.slice(0, maxLen) + '...' : value;
+}
+
+function detailValueHtml(label, fullValue, maxLen) {
+    if (!fullValue) return `<span class="detail-value"></span>`;
+    if (fullValue.length <= maxLen) {
+        return `<span class="detail-value">${escHtml(fullValue)}</span>`;
+    }
+    const truncated = escHtml(fullValue.slice(0, maxLen)) + '...';
+    const safeLabel = escHtml(label).replace(/'/g, "\\'");
+    const safeValue = escHtml(fullValue).replace(/'/g, "\\'");
+    return `<span class="detail-value">
+        <span>${truncated}</span>
+        <span class="detail-value-clickable" onclick="event.stopPropagation();showValuePopup('${safeLabel}','${safeValue}')" style="margin-left:4px;font-size:12px">查看全部</span>
+    </span>`;
+}
+
 function toggleDetail(encodedDomain) {
     const el = document.getElementById('detail-' + encodedDomain);
     if (!el) return;
@@ -586,8 +664,7 @@ function toggleDetail(encodedDomain) {
                 if (authTokens.length > 0) {
                     html += `<div class="detail-section-title">🔐 认证凭据 <span class="auth-badge">${authTokens.length}</span></div>`;
                     for (const t of authTokens) {
-                        const tv = t.value.length > 80 ? t.value.slice(0, 80) + '...' : t.value;
-                        html += `<div class="detail-row"><span class="detail-name">${escHtml(t.key)} <small style="color:var(--text-dim)">[${t.source}]</small></span><span class="detail-value">${escHtml(tv)}</span></div>`;
+                        html += `<div class="detail-row detail-row-auth"><span class="detail-name">${escHtml(t.key)} <small style="color:var(--text-dim)">[${t.source}]</small></span>${detailValueHtml(t.key, t.value, 200)}</div>`;
                     }
                 }
 
@@ -596,8 +673,7 @@ function toggleDetail(encodedDomain) {
                 if (Object.keys(headers).length > 0) {
                     html += `<div class="detail-section-title" style="color:var(--accent)">📡 公共 Request Headers <span class="auth-badge" style="background:var(--accent)">${Object.keys(headers).length}</span></div>`;
                     for (const [k, v] of Object.entries(headers)) {
-                        const dv = v.length > 80 ? v.slice(0, 80) + '...' : v;
-                        html += `<div class="detail-row"><span class="detail-name" style="color:var(--accent)">${escHtml(k)}</span><span class="detail-value">${escHtml(dv)}</span></div>`;
+                        html += `<div class="detail-row"><span class="detail-name" style="color:var(--accent)">${escHtml(k)}</span>${detailValueHtml(k, v, 200)}</div>`;
                     }
                 }
 
@@ -885,7 +961,7 @@ document.body.addEventListener('htmx:beforeSwap', function(evt) {
                     const urlInfo = s.original_url ? `<div class="session-meta" style="color:var(--accent);font-size:11px">${escHtml(s.original_url)}</div>` : '';
                     const encDom = encodeURIComponent(s.domain);
                     html += `
-                    <div class="session-item">
+                    <div class="session-item" onclick="toggleDetail('${encDom}')">
                         <span class="session-icon">🌐</span>
                         <div class="session-info">
                             <div class="session-domain">${escHtml(s.domain)} ${tag}</div>
@@ -893,9 +969,9 @@ document.body.addEventListener('htmx:beforeSwap', function(evt) {
                             ${urlInfo}
                         </div>
                         <div class="session-actions">
-                            <button class="btn btn-sm btn-refresh" onclick="refreshSession('${escHtml(s.domain)}')" id="refresh-btn-${encDom}">更新</button>
-                            <button class="btn btn-sm btn-primary" onclick="toggleDetail('${encDom}')">查看</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteSession('${escHtml(s.domain)}')">删除</button>
+                            <button class="btn btn-sm btn-refresh" onclick="event.stopPropagation();refreshSession('${escHtml(s.domain)}')" id="refresh-btn-${encDom}">更新</button>
+                            <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();toggleDetail('${encDom}')">查看</button>
+                            <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteSession('${escHtml(s.domain)}')">删除</button>
                         </div>
                     </div>
                     <div id="detail-${encodeURIComponent(s.domain)}" style="display:none"></div>`;
