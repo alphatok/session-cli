@@ -155,7 +155,14 @@ def cmd_serve():
         from server import app
         import uvicorn
         print("[*] 启动 Session Manager Web UI: http://127.0.0.1:8000")
-        uvicorn.run(app, host="127.0.0.1", port=8000)
+        print("[*] 按 Ctrl+C 关闭")
+        # Windows 上避免 ProactorEventLoop 关闭时的 NoneType 报错
+        config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info", timeout_graceful_shutdown=2)
+        server = uvicorn.Server(config)
+        try:
+            server.run()
+        except KeyboardInterrupt:
+            pass
     except ImportError:
         print("[✗] 请先安装 Web 依赖: uv add fastapi uvicorn jinja2")
         sys.exit(1)

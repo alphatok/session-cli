@@ -18,6 +18,7 @@ import queue
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 import core
 from core.mcp_manager import McpManager, grab_cookies_managed
@@ -157,20 +158,29 @@ async def lifespan(app: FastAPI):
         _emit_log("error", f"Vault 解锁失败: {e}")
     try:
         yield
+    except (GeneratorExit, asyncio.CancelledError):
+        # Ctrl+C 触发的关闭，正常流程
+        pass
     finally:
         print("[*] 正在关闭服务...")
-        # 1. 通知所有 SSE 生成器退出
+        # 1. 先通知 SSE 生成器退出，取消活跃任务
         _shutdown_event.set()
-        # 2. 取消所有活跃的抓取任务
         with _active_tasks_lock:
             for evt in _active_tasks.values():
                 evt.set()
             _active_tasks.clear()
-        # 3. 直接终止 MCP 进程（避免 mgr.disconnect() 阻塞在 _comm_lock 上）
+        # 2. 等待 SSE 生成器优雅退出（可被 cancel 打断，不影响后续清理）
+        try:
+            await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            pass
+        # 3. 清理 SSE 队列
+        with _progress_lock:
+            _progress_queues.clear()
+        # 4. 终止 MCP 进程（直接 kill，避免阻塞在锁上）
         try:
             mgr = McpManager.get_instance()
             if mgr.is_connected():
-                # 直接 kill，不等待锁
                 proc = mgr._proc
                 if proc is not None:
                     try:
@@ -186,15 +196,29 @@ async def lifespan(app: FastAPI):
                 print("[✓] MCP 连接已关闭")
         except Exception:
             pass
-        # 4. 清理 SSE 队列
-        with _progress_lock:
-            _progress_queues.clear()
-        # 5. 短暂等待 SSE 生成器退出
-        await asyncio.sleep(0.2)
         print("[✓] 服务已关闭")
 
 
+# ── Graceful shutdown middleware ──────────────────────────────
+
+class _GracefulShutdownMiddleware:
+    """拦截 SSE 连接在关闭时的 CancelledError，只打 WARN 日志。"""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        except asyncio.CancelledError:
+            _emit_log("warn", "SSE 连接未关闭（服务正在停止，属正常行为）")
+
+
 app = FastAPI(title="Session Manager", version="2.0", lifespan=lifespan)
+app.add_middleware(_GracefulShutdownMiddleware)
 
 
 # ── Routes ────────────────────────────────────────────────────
@@ -238,16 +262,20 @@ async def api_grab_progress(task_id: str = Query(...)):
     q = _get_or_create_queue(task_id)
 
     async def event_stream():
-        while not _shutdown_event.is_set():
-            try:
-                msg = await asyncio.to_thread(q.get, True, 0.1)
-                yield f"data: {msg}\n\n"
-                data = json.loads(msg)
-                if data.get("stage") in ("completed", "error", "cancelled"):
-                    break
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                await asyncio.sleep(0.5)
+        try:
+            while not _shutdown_event.is_set():
+                try:
+                    msg = await asyncio.to_thread(q.get, True, 0.05)
+                    yield f"data: {msg}\n\n"
+                    data = json.loads(msg)
+                    if data.get("stage") in ("completed", "error", "cancelled"):
+                        break
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            # uvicorn 关闭时正常 cancel SSE 连接
+            pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -315,18 +343,22 @@ async def api_logs_recent():
 async def api_logs_stream():
     """SSE 流式推送日志。"""
     async def event_stream():
-        # 先发送历史日志
-        with _log_lock:
-            for entry in _log_history:
-                yield f"data: {json.dumps(entry)}\n\n"
-        # 持续推送新日志
-        while not _shutdown_event.is_set():
-            try:
-                entry = await asyncio.to_thread(_log_queue.get, True, 0.5)
-                yield f"data: {json.dumps(entry)}\n\n"
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                await asyncio.sleep(0.5)
+        try:
+            # 先发送历史日志
+            with _log_lock:
+                for entry in _log_history:
+                    yield f"data: {json.dumps(entry)}\n\n"
+            # 持续推送新日志
+            while not _shutdown_event.is_set():
+                try:
+                    entry = await asyncio.to_thread(_log_queue.get, True, 0.1)
+                    yield f"data: {json.dumps(entry)}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            # uvicorn 关闭时正常 cancel SSE 连接
+            pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
