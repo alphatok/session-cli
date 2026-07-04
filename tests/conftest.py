@@ -206,6 +206,72 @@ def sample_network_detail_md2():
 
 
 @pytest.fixture
+def sample_network_detail_with_setcookie():
+    """模拟包含 Set-Cookie 响应头的请求详情。"""
+    return (
+        "## Request https://example.com/api/login\n"
+        "Status: 200\n"
+        "### Request Headers\n"
+        "- authorization:Bearer xxx\n"
+        "- :authority:example.com\n"
+        "### Response Headers\n"
+        "- set-cookie:session=abc123; Expires=Sat, 04 Jul 2026 16:25:38 GMT; HttpOnly; Secure\n"
+        "- set-cookie:token=xyz789; Max-Age=3600; Path=/\n"
+        "- content-type:application/json\n"
+    )
+
+
+@pytest.fixture
+def sample_network_list_new_md():
+    """模拟新版 chrome-devtools-mcp 的 list_network_requests 返回格式（reqid=N 行格式）。"""
+    return (
+        "## Network requests\n"
+        "Showing 1-3 of 3 (Page 1 of 1).\n"
+        "reqid=1 GET https://example.com/api/me [200]\n"
+        "reqid=2 POST https://example.com/api/data [201]\n"
+        "reqid=3 GET https://other.com/analytics [200]\n"
+    )
+
+
+@pytest.fixture
+def sample_network_detail_new_md():
+    """模拟新版 chrome-devtools-mcp 的 get_network_request 返回格式（URL 在标题中，compact headers）。"""
+    return (
+        "## Request https://example.com/api/me\n"
+        "Status: 200\n"
+        "### Request Headers\n"
+        "- authorization:Bearer eyJhbGciOiJIUzI1NiJ9.xxx\n"
+        "- user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\n"
+        "- accept:application/json, text/plain, */*\n"
+        "- :authority:example.com\n"
+        "- :method:GET\n"
+        "- :path:/api/me\n"
+        "- :scheme:https\n"
+        "### Response Headers\n"
+        "- content-type:application/json\n"
+    )
+
+
+@pytest.fixture
+def sample_network_detail_new_md2():
+    """模拟新版第二个请求详情（带 Content-Type 和 Cookie）。"""
+    return (
+        "## Request https://example.com/api/data\n"
+        "Status: 201\n"
+        "### Request Headers\n"
+        "- authorization:Bearer eyJhbGciOiJIUzI1NiJ9.xxx\n"
+        "- user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\n"
+        "- accept:application/json\n"
+        "- content-type:application/json\n"
+        "- referer:https://example.com/dashboard\n"
+        "- cookie:session=abc\n"
+        "- :authority:example.com\n"
+        "### Response Headers\n"
+        "- content-type:application/json\n"
+    )
+
+
+@pytest.fixture
 def sample_grab_with_headers():
     """模拟完整的抓取返回结构（含 headers + raw_requests）。"""
     return {

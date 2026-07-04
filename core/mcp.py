@@ -16,6 +16,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Callable, Dict, Optional
 
 # ── 跨平台 npx 查找 ──────────────────────────────────────────
@@ -384,15 +386,20 @@ def _is_same_or_subdomain(url_text: str, domain: str) -> bool:
 
 
 def _parse_network_list_table(text: str, domain: str) -> tuple[list[int], set[str]]:
-    """解析 list_network_requests 返回的 Markdown 表格，提取目标域名 reqid + 全部 hostname。
+    """解析 list_network_requests 返回的网络请求列表，提取目标域名 reqid + 全部 hostname。
 
-    chrome-devtools-mcp 的 list_network_requests 返回格式示例:
+    支持两种 chrome-devtools-mcp 返回格式：
+
+    格式 1（新版）:
+        ## Network requests
+        Showing 1-1 of 1 (Page 1 of 1).
+        reqid=1 POST https://example.com/api/me [200]
+
+    格式 2（旧版 Markdown 表格，向后兼容）:
         ## Network Requests
-        Showing 1-30 of 50
         | ReqId | Method | URL | Status | Type |
         |-------|--------|-----|--------|------|
         | 3 | GET | https://example.com/api/me | 200 | XHR |
-        | 4 | POST | https://other.com/analytics | 200 | XHR |
 
     Args:
         text: MCP 返回的 Markdown 文本
@@ -407,26 +414,39 @@ def _parse_network_list_table(text: str, domain: str) -> tuple[list[int], set[st
 
     reqids: list[int] = []
     all_hostnames: set[str] = set()
-    in_table = False
 
+    # ── 格式 1: reqid=N METHOD URL [STATUS]（新版 chrome-devtools-mcp）──
+    for m in re.finditer(r'^reqid=(\d+)\s+(\w+)\s+(https?://[^\s]+)\s*\[(\d+)\]', text, re.MULTILINE):
+        reqid = int(m.group(1))
+        url = m.group(3)
+
+        hostname = _extract_hostname(url)
+        if hostname:
+            all_hostnames.add(hostname)
+
+        if _is_same_or_subdomain(url, domain):
+            reqids.append(reqid)
+
+    # 如果新版格式匹配到了请求，直接返回
+    if reqids:
+        return reqids, all_hostnames
+
+    # ── 格式 2: Markdown 表格（旧版，向后兼容）──
+    in_table = False
     for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue
 
-        # 检测表格行（以 | 开头且包含 | 分隔符）
         if line.startswith("|") and "|" in line[1:]:
-            # 跳过表头分隔行
             if re.match(r"^\|[\s\-:]+\|", line):
                 in_table = True
                 continue
             if in_table:
-                # 提取全部 hostname（用于 related_domains）
                 hostname = _extract_hostname(line)
                 if hostname:
                     all_hostnames.add(hostname)
 
-                # 目标域名匹配（用于 Header 分析）
                 if _is_same_or_subdomain(line, domain):
                     parts = [p.strip() for p in line.split("|") if p.strip()]
                     if parts and parts[0].isdigit():
@@ -440,64 +460,87 @@ def _parse_network_list_table(text: str, domain: str) -> tuple[list[int], set[st
 
 
 def _parse_network_request_detail(text: str) -> Optional[dict]:
-    """解析 get_network_request 返回的 Markdown 详细视图，提取 Request Headers。
+    """解析 get_network_request 返回的 Markdown 详细视图，提取 Request Headers + Set-Cookie。
 
-    chrome-devtools-mcp 的 get_network_request 返回格式示例:
+    支持两种 chrome-devtools-mcp 返回格式：
+
+    格式 1（新版，URL 在标题中）:
+        ## Request https://example.com/api/data
+        Status: 200
+        ### Request Headers
+        - Authorization: Bearer xxx
+        - :authority:example.com
+
+    格式 2（旧版，URL/Method 单独成行，向后兼容）:
         ## Request #1
         URL: https://example.com/api/data
         Method: GET
         Status: 200
-
         ### Request Headers
-        - Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.xxx
-        - User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...
-        - Accept: application/json, text/plain, */*
-
-        ### Response Headers
-        - Content-Type: application/json
+        - Authorization: Bearer xxx
 
     Args:
         text: MCP 返回的 Markdown 文本
 
     Returns:
-        {"url": str, "method": str, "headers": {key: value}} 或 None
+        {"url": str, "method": str, "headers": {key: value}, "set_cookies": [str]} 或 None
     """
     if not isinstance(text, str):
         return None
 
-    result: dict = {"url": "", "method": "GET", "headers": {}}
+    result: dict = {"url": "", "method": "GET", "headers": {}, "set_cookies": []}
 
-    # 提取 URL 和 Method
-    url_m = re.search(r"URL:\s*(.+)", text)
+    # ── 提取 URL ──
+    # 格式 1: ## Request https://example.com/api
+    url_m = re.search(r'^## Request\s+(https?://\S+)', text, re.MULTILINE)
     if url_m:
         result["url"] = url_m.group(1).strip()
+    else:
+        # 格式 2: URL: https://example.com/api
+        url_m = re.search(r"URL:\s*(.+)", text)
+        if url_m:
+            result["url"] = url_m.group(1).strip()
 
+    # Method 仅在旧版格式中有独立行
     method_m = re.search(r"Method:\s*(\w+)", text)
     if method_m:
         result["method"] = method_m.group(1).strip()
 
-    # 定位 Request Headers 区块
-    in_req_headers = False
+    # ── 定位 Request Headers 区块 ──
+    in_section: bool = False
+    section: str = ""  # "request" | "response"
     for line in text.split("\n"):
         line_stripped = line.strip()
 
-        if not in_req_headers:
-            if "Request Headers" in line_stripped:
-                in_req_headers = True
+        # 切换区块
+        if "Request Headers" in line_stripped:
+            in_section = True
+            section = "request"
+            continue
+        elif "Response Headers" in line_stripped:
+            in_section = True
+            section = "response"
+            continue
+        elif line_stripped.startswith("###") or line_stripped.startswith("---"):
+            in_section = False
+            section = ""
             continue
 
-        # 检测区块结束（### Response Headers 或下一个 ### 标题 或 ---）
-        if line_stripped.startswith("###") or line_stripped.startswith("---"):
-            break
+        if not in_section:
+            continue
 
-        # 解析 "- Key: Value" 或 "- Key: Value" 格式
-        # 也支持 "* Key: Value" 或 tab 缩进格式
+        # 解析 "- Key: Value" 或 "- key:value"（支持冒号前后无空格）
         m = re.match(r"[\-\*\t]\s*(.+?)\s*:\s*(.+)", line_stripped)
         if m:
             key = m.group(1).strip()
             value = m.group(2).strip()
-            if key and value:
+            if not key or not value:
+                continue
+
+            if section == "request":
                 result["headers"][key] = value
+            elif section == "response" and key.lower() == "set-cookie":
+                result["set_cookies"].append(value)
 
     if not result["url"] and not result["headers"]:
         return None
@@ -510,7 +553,7 @@ def _compute_common_headers(raw_requests: list[dict]) -> dict[str, str]:
     算法:
         1. 统计每个 Header 键在所有请求中出现的次数及值
         2. 若某个 Header 在 >=50% 的请求中出现且值完全相同 → 标记为"公共 Header"
-        3. 优先关注非标准浏览器头（如 Authorization, X-*, Cookie 等）
+        3. 单请求场景（total=1）：返回该请求的全部非动态 Header
 
     Args:
         raw_requests: [{"url", "method", "headers": {key: value}}] 列表
@@ -522,13 +565,23 @@ def _compute_common_headers(raw_requests: list[dict]) -> dict[str, str]:
         return {}
 
     total = len(raw_requests)
-    threshold = max(total * 0.5, 2)  # 至少 2 个请求或 50%
+    # 阈值逻辑：单请求时返回全部非动态 Header；多请求时至少 2 个或 50%
+    if total == 1:
+        threshold = 1
+    else:
+        threshold = max(int(total * 0.5), 2)
+
+    # HTTP/2 伪头部，不应作为公共业务 Header 返回
+    h2_pseudo_headers = {":authority", ":method", ":path", ":scheme", ":status"}
 
     # 统计每个 Header 键在哪些请求中出现，对应的值是什么
     # key → {value: count, ...}
     header_stats: dict[str, dict[str, int]] = {}
     for req in raw_requests:
         for k, v in req.get("headers", {}).items():
+            # 跳过 HTTP/2 伪头部
+            if k in h2_pseudo_headers:
+                continue
             if k not in header_stats:
                 header_stats[k] = {}
             header_stats[k][v] = header_stats[k].get(v, 0) + 1
@@ -560,17 +613,67 @@ def _compute_common_headers(raw_requests: list[dict]) -> dict[str, str]:
     return common
 
 
+def _parse_cookie_expiry(set_cookies: list[str]) -> Optional[datetime]:
+    """从 Set-Cookie 响应头列表中解析最早的过期时间。
+
+    支持的格式:
+        - expires=Sat, 04 Jul 2026 16:25:38 GMT  (HTTP-date)
+        - max-age=3600  (相对秒数)
+
+    Args:
+        set_cookies: Set-Cookie 头值列表
+
+    Returns:
+        最早的过期 datetime (UTC)，若无法解析则返回 None
+    """
+    now = datetime.now(timezone.utc)
+    earliest: Optional[datetime] = None
+
+    for raw in set_cookies:
+        raw_lower = raw.lower()
+        expiry: Optional[datetime] = None
+
+        # 尝试解析 expires= (HTTP-date)
+        m = re.search(r'expires\s*=\s*(.+?)(?:;|$)', raw_lower)
+        if m:
+            try:
+                # parsedate_to_datetime 返回 naive datetime，需加 UTC
+                parsed = parsedate_to_datetime(m.group(1).strip())
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                expiry = parsed
+            except (ValueError, TypeError):
+                pass
+
+        # 尝试解析 max-age= (相对秒数)
+        if expiry is None:
+            m = re.search(r'max-age\s*=\s*(\d+)', raw_lower)
+            if m:
+                try:
+                    expiry = now + timedelta(seconds=int(m.group(1)))
+                except ValueError:
+                    pass
+
+        # 取最早的过期时间
+        if expiry is not None:
+            if earliest is None or expiry < earliest:
+                earliest = expiry
+
+    return earliest
+
+
 def _grab_network_headers(
     proc,  # subprocess.Popen
     domain: str,
     on_progress: Optional[Callable[[str, str], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     max_requests: int = 15,
-) -> tuple[dict[str, str], list[dict], list[str]]:
-    """通过 CDP Network 域抓取页面的 Request Headers + 关联域名。
+) -> tuple[dict[str, str], list[dict], list[str], Optional[datetime]]:
+    """通过 CDP Network 域抓取页面的 Request Headers + 关联域名 + Cookie 过期时间。
 
     在页面加载后调用，捕获网络请求的 Request Headers 并分析公共头，
-    同时收集所有被请求的域名作为 related_domains。
+    同时收集所有被请求的域名作为 related_domains，
+    并从 Set-Cookie 响应头解析真实 Cookie 过期时间。
 
     Args:
         proc: 已初始化握手的 MCP subprocess.Popen 进程
@@ -580,7 +683,7 @@ def _grab_network_headers(
         max_requests: 最多分析的请求数（避免过多 JSON-RPC 调用）
 
     Returns:
-        (common_headers: {key: value}, raw_requests: [...], related_domains: [str])
+        (common_headers, raw_requests, related_domains, cookie_expires_at)
     """
     def _check_cancelled():
         if cancel_event and cancel_event.is_set():
@@ -608,13 +711,14 @@ def _grab_network_headers(
 
     if not reqids:
         progress("network_done", f"未捕获到匹配的网络请求，发现 {len(related_domains)} 个关联域名")
-        return {}, [], related_domains
+        return {}, [], related_domains, None
 
     _check_cancelled()
     progress("network_capture", f"捕获到 {len(reqids)} 个请求，正在分析...")
 
     # Step 2: 逐个获取请求详情
     raw_requests: list[dict] = []
+    set_cookies_all: list[str] = []
     analyzed = 0
 
     for reqid in reqids[:max_requests]:
@@ -638,12 +742,17 @@ def _grab_network_headers(
                     "headers": detail["headers"],
                 })
                 analyzed += 1
+                # 收集 Set-Cookie 用于计算真实过期时间
+                if detail.get("set_cookies"):
+                    set_cookies_all.extend(detail["set_cookies"])
 
     _check_cancelled()
+    # 从所有 Set-Cookie 中解析最早过期时间
+    cookie_expires_at = _parse_cookie_expiry(set_cookies_all) if set_cookies_all else None
 
     progress("network_done", f"捕获 {len(raw_requests)} 个原始请求, {len(related_domains)} 个关联域名")
 
-    return _compute_common_headers(raw_requests), raw_requests, related_domains
+    return _compute_common_headers(raw_requests), raw_requests, related_domains, cookie_expires_at
 
 
 # ── 增强版 Cookie + 凭据采集 JS 脚本 ───────────────────────────
@@ -796,8 +905,9 @@ def _grab_cookies_impl(
     # Step 3: 捕获网络请求 Request Headers（CDP Network 域）
     _check_cancelled()
     progress("network", "捕获网络请求头...")
+    cookie_expires_at = None
     try:
-        common_headers, raw_requests, related_domains = _grab_network_headers(
+        common_headers, raw_requests, related_domains, cookie_expires_at = _grab_network_headers(
             proc, domain, on_progress=on_progress, cancel_event=cancel_event
         )
     except Exception:
@@ -832,7 +942,7 @@ def _grab_cookies_impl(
                 if name:
                     result[name.strip()] = value
         progress("done", f"获取到 {len(result)} 个 Cookie")
-        return {"cookies": result, "auth_tokens": [], "headers": common_headers, "raw_requests": raw_requests, "related_domains": related_domains}
+        return {"cookies": result, "auth_tokens": [], "headers": common_headers, "raw_requests": raw_requests, "related_domains": related_domains, "cookie_expires_at": cookie_expires_at}
 
     # 原始存取：直接取 cookie 字符串和全量 localStorage/sessionStorage
     raw_cookie = data.get("cookie", "") or ""
@@ -849,7 +959,7 @@ def _grab_cookies_impl(
             auth_tokens.append({"source": "sessionStorage", "key": key, "value": value})
 
     progress("done", f"获取到 Cookie 原始字符串, {len(auth_tokens)} 个存储凭据, {len(common_headers)} 个公共 Header, {len(related_domains)} 个关联域名")
-    return {"cookies": raw_cookie, "auth_tokens": auth_tokens, "headers": common_headers, "raw_requests": raw_requests, "related_domains": related_domains}
+    return {"cookies": raw_cookie, "auth_tokens": auth_tokens, "headers": common_headers, "raw_requests": raw_requests, "related_domains": related_domains, "cookie_expires_at": cookie_expires_at}
 
 
 def grab_cookies(

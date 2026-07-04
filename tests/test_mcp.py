@@ -16,6 +16,7 @@ from core.mcp import (
     _jsonrpc_send,
     _parse_network_list_table,
     _parse_network_request_detail,
+    _parse_cookie_expiry,
     _compute_common_headers,
     _extract_hostname,
     _is_same_or_subdomain,
@@ -328,6 +329,24 @@ class TestParseNetworkListTable:
         assert "cdn.static.example.com" in all_hostnames
         assert "notexample.com" in all_hostnames
 
+    def test_new_format_reqid_style(self, sample_network_list_new_md):
+        """新版 reqid=1 GET URL [200] 格式解析。"""
+        reqids, all_hostnames = _parse_network_list_table(sample_network_list_new_md, "example.com")
+        assert 1 in reqids
+        assert 2 in reqids
+        assert 3 not in reqids  # other.com
+        assert "example.com" in all_hostnames
+        assert "other.com" in all_hostnames
+
+    def test_new_format_mixed_with_old(self):
+        """新版格式优先匹配，不会误触发旧版表格解析。"""
+        text = (
+            "## Network requests\n"
+            "reqid=1 GET https://example.com/api [200]\n"
+        )
+        reqids, _ = _parse_network_list_table(text, "example.com")
+        assert reqids == [1]
+
 
 class TestParseNetworkRequestDetail:
     """get_network_request 详细视图解析。"""
@@ -354,6 +373,93 @@ class TestParseNetworkRequestDetail:
         assert result is not None
         assert result["url"] == "https://example.com/"
         assert result["headers"] == {}
+
+    def test_new_format_url_in_title(self, sample_network_detail_new_md):
+        """新版格式：URL 在 ## Request 标题中，compact headers。"""
+        result = _parse_network_request_detail(sample_network_detail_new_md)
+        assert result is not None
+        assert result["url"] == "https://example.com/api/me"
+        # 新版格式没有独立 Method 行，默认为 GET
+        assert result["method"] == "GET"
+        assert "authorization" in result["headers"]
+        assert result["headers"]["authorization"] == "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"
+        assert "user-agent" in result["headers"]
+        # H2 伪头部正常解析
+        assert ":authority" in result["headers"]
+        assert result["headers"][":authority"] == "example.com"
+        # 不包含 Response Headers
+        assert "content-type" not in result["headers"]
+
+    def test_old_format_still_works(self, sample_network_detail_md):
+        """旧版格式仍然正常工作。"""
+        result = _parse_network_request_detail(sample_network_detail_md)
+        assert result is not None
+        assert result["url"] == "https://example.com/api/me"
+        assert result["method"] == "GET"
+        assert "Authorization" in result["headers"]
+
+
+    def test_parses_set_cookie_from_response(self, sample_network_detail_with_setcookie):
+        """从 Response Headers 中提取 Set-Cookie 值。"""
+        result = _parse_network_request_detail(sample_network_detail_with_setcookie)
+        assert result is not None
+        assert result["url"] == "https://example.com/api/login"
+        assert "authorization" in result["headers"]
+        assert len(result["set_cookies"]) == 2
+        assert "session=abc123" in result["set_cookies"][0]
+        assert "Max-Age=3600" in result["set_cookies"][1]
+
+    def test_new_format_no_set_cookie(self, sample_network_detail_new_md):
+        """无 Set-Cookie 时返回空列表。"""
+        result = _parse_network_request_detail(sample_network_detail_new_md)
+        assert result is not None
+        assert result["set_cookies"] == []
+
+
+class TestParseCookieExpiry:
+    """_parse_cookie_expiry 从 Set-Cookie 解析过期时间。"""
+
+    def test_parses_expires_http_date(self):
+        """解析 expires= HTTP-date 格式。"""
+        set_cookies = [
+            "session=abc; Expires=Sat, 04 Jul 2026 16:25:38 GMT; HttpOnly"
+        ]
+        from datetime import datetime, timezone
+        result = _parse_cookie_expiry(set_cookies)
+        assert result is not None
+        assert result.year == 2026
+        assert result.month == 7
+        assert result.day == 4
+
+    def test_parses_max_age(self):
+        """解析 max-age= 相对秒数。"""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        set_cookies = ["token=xyz; Max-Age=3600; Path=/"]
+        result = _parse_cookie_expiry(set_cookies)
+        assert result is not None
+        delta = (result - now).total_seconds()
+        assert 3500 < delta < 3700  # 约 3600 秒
+
+    def test_earliest_expiry(self):
+        """多个 Set-Cookie 时取最早过期时间。"""
+        set_cookies = [
+            "a=1; Max-Age=7200",     # 2 小时后过期
+            "b=2; Max-Age=3600",     # 1 小时后过期
+        ]
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        result = _parse_cookie_expiry(set_cookies)
+        assert result is not None
+        delta = (result - now).total_seconds()
+        assert 3500 < delta < 3700  # 取最早的 3600
+
+    def test_empty_returns_none(self):
+        assert _parse_cookie_expiry([]) is None
+
+    def test_unparseable_returns_none(self):
+        """无法解析的 Set-Cookie 返回 None。"""
+        assert _parse_cookie_expiry(["no expiry info here"]) is None
 
 
 class TestComputeCommonHeaders:
@@ -406,7 +512,7 @@ class TestComputeCommonHeaders:
         assert _compute_common_headers([]) == {}
 
     def test_single_request(self):
-        """单个请求时阈值不足以判定公共头。"""
+        """单个请求时返回全部非动态 Header（修复：单请求场景 threshold=1）。"""
         raw = [
             {"url": "a", "method": "GET", "headers": {
                 "Authorization": "Bearer xxx",
@@ -414,10 +520,31 @@ class TestComputeCommonHeaders:
             }},
         ]
         result = _compute_common_headers(raw)
-        # threshold = max(1*0.5, 2) = 2, 所以单个请求不会有公共头
-        for k in result:
-            pass  # 可能为空
-        # 实际上 threshold 至少为 2，所以单个请求不会有任何公共头
+        # 单请求时 threshold=1，全部非动态 headers 应被返回
+        assert result["Authorization"] == "Bearer xxx"
+        assert result["User-Agent"] == "Mozilla/5.0"
+
+    def test_single_request_with_h2_pseudo_headers(self):
+        """单个请求时过滤 HTTP/2 伪头部（:authority, :method 等）。"""
+        raw = [
+            {"url": "a", "method": "POST", "headers": {
+                ":authority": "example.com",
+                ":method": "POST",
+                ":path": "/api/test",
+                ":scheme": "https",
+                "Authorization": "Bearer token123",
+                "Apiclient": "saas-pc",
+            }},
+        ]
+        result = _compute_common_headers(raw)
+        # HTTP/2 伪头部应被过滤
+        assert ":authority" not in result
+        assert ":method" not in result
+        assert ":path" not in result
+        assert ":scheme" not in result
+        # 业务头部应保留
+        assert result["Authorization"] == "Bearer token123"
+        assert result["Apiclient"] == "saas-pc"
 
     def test_skips_empty_values(self):
         raw = [

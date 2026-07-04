@@ -12,7 +12,7 @@ Session CRUD — 站点 Cookie 的存储、查询、删除。
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from core.vault import get_vault, utcnow
@@ -254,11 +254,11 @@ def get_site(domain: str) -> Optional[dict]:
 
 
 def store_site(domain: str, data: dict, original_url: str = "") -> dict:
-    """存储站点的 Cookie + 认证凭据到 Vault（默认 30 天过期）。
+    """存储站点的 Cookie + 认证凭据到 Vault（优先使用真实 Cookie 过期时间，回退 30 天）。
 
     Args:
         domain: 目标域名（Vault 存储 key）
-        data: grab_cookies() 返回的完整 dict，包含 "cookies"（原始字符串）和 "auth_tokens"
+        data: grab_cookies() 返回的完整 dict，包含 "cookies"（原始字符串）、"auth_tokens" 和可选的 "cookie_expires_at"
         original_url: 用户输入的原始完整 URL（用于后续更新时导航到原始页面）
 
     Returns:
@@ -269,6 +269,7 @@ def store_site(domain: str, data: dict, original_url: str = "") -> dict:
     headers = data.get("headers", {})
     raw_requests = data.get("raw_requests", [])
     related_domains = data.get("related_domains", [])
+    cookie_expires_at = data.get("cookie_expires_at")  # Optional[datetime]
 
     # 合并 Cookie + Auth Tokens + Headers + Raw Requests + Related Domains + Original URL
     merged = _encode_auth_tokens(cookies, auth_tokens)
@@ -276,12 +277,16 @@ def store_site(domain: str, data: dict, original_url: str = "") -> dict:
     merged.update(_encode_related(related_domains))
     merged.update(_encode_url(original_url))
 
+    # 优先使用真实过期时间，回退到 30 天
+    real_expiry = cookie_expires_at if isinstance(cookie_expires_at, datetime) else None
+    expires_at = real_expiry if real_expiry else utcnow() + timedelta(days=30)
+
     cookie_count = cookies.count(";") + 1 if cookies else 0
     vault = get_vault()
     vault.store_session(
         domain=domain,
         cookies=merged,
-        expires_at=utcnow() + timedelta(days=30),
+        expires_at=expires_at,
     )
     return {
         "domain": domain,
