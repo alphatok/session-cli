@@ -12,6 +12,7 @@ from core.session import (
     _encode_auth_tokens, _decode_auth_tokens,
     _encode_headers, _decode_headers,
     _encode_related, _decode_related,
+    _encode_url, _decode_url,
 )
 
 
@@ -59,7 +60,7 @@ class TestGetSite:
         from datetime import datetime, UTC
         s = MagicMock()
         s.domain = "example.com"
-        s.cookies = {"token": "abc", "uid": "123"}
+        s.cookies = {"__raw__cookie": "token=abc; uid=123"}
         s.created_at = datetime(2026, 1, 1, 12, 0)
         s.expires_at = datetime(2026, 12, 31, 12, 0)
 
@@ -70,7 +71,7 @@ class TestGetSite:
         result = get_site("example.com")
         assert result["domain"] == "example.com"
         assert result["cookie_count"] == 2
-        assert result["cookies"]["token"] == "abc"
+        assert result["cookies"] == "token=abc; uid=123"
         v.close.assert_not_called()
 
     @patch("core.session.get_vault")
@@ -101,7 +102,7 @@ class TestStoreSite:
         v.store_session.side_effect = capture_store
         mock_get_vault.return_value = v
 
-        data = {"cookies": {"key": "val"}, "auth_tokens": [], "headers": {}, "raw_requests": []}
+        data = {"cookies": "key=val", "auth_tokens": [], "headers": {}, "raw_requests": []}
         result = store_site("test.com", data)
         assert result["domain"] == "test.com"
         assert result["cookie_count"] == 1
@@ -131,7 +132,7 @@ class TestStoreSite:
         # 验证编码后的 cookies 包含 __auth__ 前缀
         assert "__auth__ls:auth_token" in stored_cookies
         assert "__auth__ls:refresh_token" in stored_cookies
-        assert stored_cookies["token"] == "abc123"
+        assert stored_cookies["__raw__cookie"] == "token=abc123; session=xyz789"
 
 
 class TestDeleteSite:
@@ -160,33 +161,30 @@ class TestAuthTokenEncodeDecode:
 
     def test_encode_merges_auth_tokens(self):
         """编码后 cookies dict 包含原始 cookie + __auth__ 前缀凭据。"""
-        cookies = {"a": "1", "b": "2"}
+        cookies = "a=1; b=2"
         auth = [
             {"source": "localStorage", "key": "access_token", "value": "xxx"},
             {"source": "sessionStorage", "key": "sess_id", "value": "yyy"},
         ]
         result = _encode_auth_tokens(cookies, auth)
 
-        assert result["a"] == "1"  # 原始 cookie 保留
-        assert result["b"] == "2"
+        assert result["__raw__cookie"] == "a=1; b=2"
         assert result["__auth__ls:access_token"] == "xxx"
         assert result["__auth__ss:sess_id"] == "yyy"
-        assert len(result) == 4
+        assert len(result) == 3
 
     def test_encode_does_not_mutate_original(self):
         """编码不修改原始 dict。"""
-        cookies = {"c": "3"}
+        cookies = "c=3"
         auth = [{"source": "localStorage", "key": "t", "value": "v"}]
         _encode_auth_tokens(cookies, auth)
-        assert "__auth__" not in str(cookies)  # 原始 dict 未被修改
+        assert cookies == "c=3"  # 原始字符串未被修改
 
     def test_decode_separates_auth_from_cookies(self, sample_auth_encoded_cookies):
         """解码将 __auth__ 条目分离为 auth_tokens。"""
-        pure, auth = _decode_auth_tokens(sample_auth_encoded_cookies)
+        raw_cookie, auth = _decode_auth_tokens(sample_auth_encoded_cookies)
 
-        assert len(pure) == 2
-        assert pure["token"] == "abc123"
-        assert pure["session"] == "xyz789"
+        assert raw_cookie == "token=abc123; session=xyz789"
 
         assert len(auth) == 3
         sources = {t["source"] for t in auth}
@@ -202,17 +200,17 @@ class TestAuthTokenEncodeDecode:
 
     def test_decode_empty_auth(self):
         """无 __auth__ 条目的 cookies 返回空 auth_tokens。"""
-        pure, auth = _decode_auth_tokens({"a": "1", "b": "2"})
-        assert pure == {"a": "1", "b": "2"}
+        raw_cookie, auth = _decode_auth_tokens({"__raw__cookie": "a=1; b=2"})
+        assert raw_cookie == "a=1; b=2"
         assert auth == []
 
     def test_decode_all_auth_no_cookies(self):
-        """全部是 __auth__ 条目时 pure cookies 为空。"""
-        pure, auth = _decode_auth_tokens({
+        """全部是 __auth__ 条目时 raw_cookie 为空。"""
+        raw_cookie, auth = _decode_auth_tokens({
             "__auth__ls:t1": "v1",
             "__auth__ss:t2": "v2",
         })
-        assert pure == {}
+        assert raw_cookie == ""
         assert len(auth) == 2
 
     def test_roundtrip_encode_decode(self, sample_grab_enriched):
@@ -221,10 +219,71 @@ class TestAuthTokenEncodeDecode:
             sample_grab_enriched["cookies"],
             sample_grab_enriched["auth_tokens"],
         )
-        pure, auth = _decode_auth_tokens(encoded)
+        raw_cookie, auth = _decode_auth_tokens(encoded)
 
-        assert pure == sample_grab_enriched["cookies"]
+        assert raw_cookie == sample_grab_enriched["cookies"]
         assert len(auth) == len(sample_grab_enriched["auth_tokens"])
+
+
+# ── 原始 URL 编解码测试 ──────────────────────────────────────────
+
+
+class TestUrlEncodeDecode:
+    """原始 URL 的 __original_url__ 编码/解码。"""
+
+    def test_encode_url(self):
+        encoded = _encode_url("https://chat.deepseek.com/a/chat/s/xxx")
+        assert encoded["__original_url__"] == "https://chat.deepseek.com/a/chat/s/xxx"
+
+    def test_encode_url_empty(self):
+        assert _encode_url("") == {}
+        assert _encode_url(None) == {}
+
+    def test_decode_url(self):
+        dat = {"__original_url__": "https://example.com/path"}
+        assert _decode_url(dat) == "https://example.com/path"
+
+    def test_decode_url_absent(self):
+        assert _decode_url({}) == ""
+        assert _decode_url({"token": "abc"}) == ""
+
+    @patch("core.session.get_vault")
+    def test_store_site_with_url(self, mock_get_vault):
+        """store_site 传入 original_url 后编码到 Vault cookies 中。"""
+        v = MagicMock()
+        stored_all = {}
+
+        def capture_store(**kwargs):
+            nonlocal stored_all
+            stored_all = dict(kwargs["cookies"])
+
+        v.store_session.side_effect = capture_store
+        mock_get_vault.return_value = v
+
+        data = {"cookies": "token=abc", "auth_tokens": [], "headers": {}, "raw_requests": []}
+        result = store_site("example.com", data, original_url="https://example.com/path")
+        assert result["original_url"] == "https://example.com/path"
+        assert stored_all["__original_url__"] == "https://example.com/path"
+
+    @patch("core.session.get_vault")
+    def test_get_site_returns_original_url(self, mock_get_vault):
+        """get_site 返回原始 URL。"""
+        from datetime import datetime, UTC
+        s = MagicMock()
+        s.domain = "example.com"
+        s.cookies = {
+            "__raw__cookie": "token=abc",
+            "__original_url__": "https://example.com/some/path",
+        }
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = get_site("example.com")
+        assert result["original_url"] == "https://example.com/some/path"
 
 
 # ── Header 编解码测试 ──────────────────────────────────────────
@@ -329,7 +388,7 @@ class TestStoreSiteWithHeaders:
         s = MagicMock()
         s.domain = "example.com"
         s.cookies = {
-            "token": "abc",
+            "__raw__cookie": "token=abc",
             "__hdr__Authorization": "Bearer xxx",
             "__hdr__Accept": "application/json",
             "__raw__requests": raw,
@@ -352,7 +411,7 @@ class TestStoreSiteWithHeaders:
         """旧数据（无 headers）读取时不崩溃，返回空。"""
         s = MagicMock()
         s.domain = "old.com"
-        s.cookies = {"token": "abc", "uid": "123"}
+        s.cookies = {"__raw__cookie": "token=abc; uid=123"}
         s.created_at = datetime(2026, 1, 1, 12, 0)
         s.expires_at = datetime(2026, 12, 31, 12, 0)
 
@@ -433,7 +492,7 @@ class TestStoreSiteWithRelated:
         mock_get_vault.return_value = v
 
         data = {
-            "cookies": {"token": "abc"},
+            "cookies": "token=abc",
             "auth_tokens": [],
             "headers": {},
             "raw_requests": [],

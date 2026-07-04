@@ -17,17 +17,22 @@ from typing import Any, Dict, List, Optional
 
 from core.vault import get_vault, utcnow
 from core.mcp import grab_cookies as _grab_cookies_via_mcp  # re-export alias
-from core.mcp import AUTH_PREFIX, HDR_PREFIX, RAW_PREFIX, REL_PREFIX
+from core.mcp import AUTH_PREFIX, HDR_PREFIX, RAW_PREFIX, REL_PREFIX, RAW_COOKIE_KEY, URL_KEY
 
 
 # ── 凭据编码/解码辅助 -------------------------------------------------
 
-def _encode_auth_tokens(cookies: Dict[str, str], auth_tokens: List[dict]) -> Dict[str, str]:
-    """将认证凭据以 __auth__ 前缀编码合并到 cookies dict 中。
+def _encode_auth_tokens(cookies: str, auth_tokens: List[dict]) -> Dict[str, str]:
+    """将认证凭据以 __auth__ 前缀编码，同时存储原始 cookie 字符串。
 
-    不会修改传入的 cookies dict，返回新 dict。
+    Args:
+        cookies: document.cookie 原始字符串
+        auth_tokens: 认证凭据列表 [{source, key, value}]
+
+    Returns:
+        编码后的 dict（可合并到主 cookies dict）
     """
-    merged = dict(cookies)  # 浅拷贝
+    merged: Dict[str, str] = {RAW_COOKIE_KEY: cookies}
     for token in auth_tokens:
         source_abbr = "ls" if token["source"] == "localStorage" else "ss"
         key = f"{AUTH_PREFIX}{source_abbr}:{token['key']}"
@@ -35,16 +40,18 @@ def _encode_auth_tokens(cookies: Dict[str, str], auth_tokens: List[dict]) -> Dic
     return merged
 
 
-def _decode_auth_tokens(cookies: Dict[str, str]) -> tuple[Dict[str, str], List[dict]]:
-    """从 cookies dict 中分离出认证凭据。
+def _decode_auth_tokens(cookies: Dict[str, str]) -> tuple[str, List[dict]]:
+    """从 cookies dict 中分离出原始 cookie 字符串和认证凭据。
 
     Returns:
-        (pure_cookies, auth_tokens) — 纯 Cookie 和认证凭据列表
+        (raw_cookie: str, auth_tokens: list) — 原始 cookie 字符串和认证凭据列表
     """
-    pure: Dict[str, str] = {}
+    raw_cookie = cookies.get(RAW_COOKIE_KEY, "")
     auth_tokens: List[dict] = []
 
     for key, value in cookies.items():
+        if key == RAW_COOKIE_KEY:
+            continue
         if key.startswith(AUTH_PREFIX):
             # 解析 "__auth__ls:token_key" 或 "__auth__ss:session_key"
             inner = key[len(AUTH_PREFIX):]  # "ls:token_key" 或 "ss:session_key"
@@ -56,10 +63,8 @@ def _decode_auth_tokens(cookies: Dict[str, str]) -> tuple[Dict[str, str], List[d
                     "key": token_key,
                     "value": value,
                 })
-        else:
-            pure[key] = value
 
-    return pure, auth_tokens
+    return raw_cookie, auth_tokens
 
 
 def _encode_headers(
@@ -147,6 +152,29 @@ def _decode_related(cookies: Dict[str, str]) -> List[str]:
         return []
 
 
+def _encode_url(original_url: str) -> Dict[str, str]:
+    """将原始 URL 编码为 Vault 键值对。
+
+    Args:
+        original_url: 用户输入的完整 URL（如 https://chat.deepseek.com/a/chat/s/xxx）
+
+    Returns:
+        编码后的 dict（可合并到主 cookies dict）
+    """
+    if not original_url:
+        return {}
+    return {URL_KEY: original_url}
+
+
+def _decode_url(cookies: Dict[str, str]) -> str:
+    """从 cookies dict 中解码原始 URL。
+
+    Returns:
+        原始 URL 字符串，无数据时返回 ""
+    """
+    return cookies.get(URL_KEY, "")
+
+
 # ── 公共 API ──────────────────────────────────────────────────
 
 
@@ -176,10 +204,12 @@ def list_sites() -> List[dict]:
         pure_cookies, auth_tokens = _decode_auth_tokens(raw_cookies)
         headers, raw_requests = _decode_headers(raw_cookies)
         related_domains = _decode_related(raw_cookies)
+        original_url = _decode_url(raw_cookies)
         expired = s.expires_at.replace(tzinfo=None) <= now.replace(tzinfo=None)
         result.append({
             "domain": s.domain,
-            "cookie_count": len(pure_cookies),
+            "original_url": original_url,
+            "cookie_count": pure_cookies.count(";") + 1 if pure_cookies else 0,
             "auth_token_count": len(auth_tokens),
             "header_count": len(headers),
             "raw_request_count": len(raw_requests),
@@ -198,15 +228,17 @@ def get_site(domain: str) -> Optional[dict]:
     if session is None:
         return None
     raw_cookies = session.cookies if isinstance(session.cookies, dict) else {}
-    pure_cookies, auth_tokens = _decode_auth_tokens(raw_cookies)
+    raw_cookie, auth_tokens = _decode_auth_tokens(raw_cookies)
     headers, raw_requests = _decode_headers(raw_cookies)
     related_domains = _decode_related(raw_cookies)
+    original_url = _decode_url(raw_cookies)
     now = utcnow()
     expired = session.expires_at.replace(tzinfo=None) <= now.replace(tzinfo=None)
     return {
         "domain": session.domain,
-        "cookies": pure_cookies,
-        "cookie_count": len(pure_cookies),
+        "original_url": original_url,
+        "cookies": raw_cookie,
+        "cookie_count": raw_cookie.count(";") + 1 if raw_cookie else 0,
         "auth_tokens": auth_tokens,
         "auth_token_count": len(auth_tokens),
         "headers": headers,
@@ -221,27 +253,30 @@ def get_site(domain: str) -> Optional[dict]:
     }
 
 
-def store_site(domain: str, data: dict) -> dict:
+def store_site(domain: str, data: dict, original_url: str = "") -> dict:
     """存储站点的 Cookie + 认证凭据到 Vault（默认 30 天过期）。
 
     Args:
-        domain: 目标域名
-        data: grab_cookies() 返回的完整 dict，包含 "cookies" 和 "auth_tokens"
+        domain: 目标域名（Vault 存储 key）
+        data: grab_cookies() 返回的完整 dict，包含 "cookies"（原始字符串）和 "auth_tokens"
+        original_url: 用户输入的原始完整 URL（用于后续更新时导航到原始页面）
 
     Returns:
-        {"domain": ..., "cookie_count": ..., "auth_token_count": ...}
+        {"domain": ..., "original_url": ..., "cookie_count": ..., "auth_token_count": ...}
     """
-    cookies = data.get("cookies", {})
+    cookies = data.get("cookies", "")  # 原始 cookie 字符串
     auth_tokens = data.get("auth_tokens", [])
     headers = data.get("headers", {})
     raw_requests = data.get("raw_requests", [])
     related_domains = data.get("related_domains", [])
 
-    # 合并 Cookie + Auth Tokens + Headers + Raw Requests + Related Domains
+    # 合并 Cookie + Auth Tokens + Headers + Raw Requests + Related Domains + Original URL
     merged = _encode_auth_tokens(cookies, auth_tokens)
     merged.update(_encode_headers(headers, raw_requests))
     merged.update(_encode_related(related_domains))
+    merged.update(_encode_url(original_url))
 
+    cookie_count = cookies.count(";") + 1 if cookies else 0
     vault = get_vault()
     vault.store_session(
         domain=domain,
@@ -250,7 +285,8 @@ def store_site(domain: str, data: dict) -> dict:
     )
     return {
         "domain": domain,
-        "cookie_count": len(cookies),
+        "original_url": original_url,
+        "cookie_count": cookie_count,
         "auth_token_count": len(auth_tokens),
         "header_count": len(headers),
         "raw_request_count": len(raw_requests),

@@ -55,14 +55,14 @@ def sample_session_rows():
 
     s1 = MagicMock()
     s1.domain = "example.com"
-    s1.cookies = {"token": "abc123", "session": "xyz789", "__auth__ls:auth_token": "Bearer eyJ..."}
+    s1.cookies = {"__raw__cookie": "token=abc123; session=xyz789", "__auth__ls:auth_token": "Bearer eyJ..."}
     s1.created_at = datetime(2026, 1, 1, 12, 0)
     s1.expires_at = datetime(2026, 12, 31, 12, 0)
     s1.id = "uuid-1"
 
     s2 = MagicMock()
     s2.domain = "test.org"
-    s2.cookies = {"auth": "def456"}
+    s2.cookies = {"__raw__cookie": "auth=def456"}
     s2.created_at = datetime(2026, 6, 1, 12, 0)
     s2.expires_at = datetime(2026, 6, 2, 12, 0)  # expired
     s2.id = "uuid-2"
@@ -114,9 +114,9 @@ def sample_mcp_grab_json():
     return (
         "Script ran on page and returned:\n"
         "```json\n"
-        '{"cookies":[{"name":"token","value":"abc123"},{"name":"session","value":"xyz789"}],'
-        '"storage":{"localStorage":{"auth_token":"Bearer eyJhbGciOiJIUzI1NiJ9.xxx","refresh_token":"rt_abc123"},'
-        '"sessionStorage":{}}}'
+        '{"cookie":"token=abc123; session=xyz789",'
+        '"localStorage":{"auth_token":"Bearer eyJhbGciOiJIUzI1NiJ9.xxx","refresh_token":"rt_abc123"},'
+        '"sessionStorage":{}}'
         "\n```"
     )
 
@@ -125,7 +125,7 @@ def sample_mcp_grab_json():
 def sample_grab_enriched():
     """模拟 grab_cookies 的增强返回结构。"""
     return {
-        "cookies": {"token": "abc123", "session": "xyz789"},
+        "cookies": "token=abc123; session=xyz789",
         "auth_tokens": [
             {"source": "localStorage", "key": "auth_token", "value": "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"},
             {"source": "localStorage", "key": "refresh_token", "value": "rt_abc123"},
@@ -137,8 +137,7 @@ def sample_grab_enriched():
 def sample_auth_encoded_cookies():
     """模拟编码后的 cookies dict（含 __auth__ 前缀凭据）。"""
     return {
-        "token": "abc123",
-        "session": "xyz789",
+        "__raw__cookie": "token=abc123; session=xyz789",
         "__auth__ls:auth_token": "Bearer eyJhbGciOiJIUzI1NiJ9.xxx",
         "__auth__ls:refresh_token": "rt_abc123",
         "__auth__ss:session_id": "sess_456",
@@ -210,7 +209,7 @@ def sample_network_detail_md2():
 def sample_grab_with_headers():
     """模拟完整的抓取返回结构（含 headers + raw_requests）。"""
     return {
-        "cookies": {"token": "abc123", "session": "xyz789"},
+        "cookies": "token=abc123; session=xyz789",
         "auth_tokens": [
             {"source": "localStorage", "key": "auth_token", "value": "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"},
         ],
@@ -254,7 +253,7 @@ def sample_header_encoded_cookies():
          "headers": {"Authorization": "Bearer xxx", "User-Agent": "Mozilla/5.0"}},
     ]
     return {
-        "token": "abc123",
+        "__raw__cookie": "token=abc123",
         "__hdr__Authorization": "Bearer xxx",
         "__hdr__User-Agent": "Mozilla/5.0",
         "__raw__requests": json.dumps(raw),

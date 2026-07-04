@@ -153,7 +153,7 @@ class TestRunGrabTask:
         with patch("server.grab_cookies_managed") as mock_grab, \
              patch("core.store_site") as mock_store:
             mock_grab.return_value = {
-                "cookies": {"token": "abc"},
+                "cookies": "token=abc",
                 "auth_tokens": [],
                 "headers": {},
                 "raw_requests": [],
@@ -177,7 +177,7 @@ class TestRunGrabTask:
         q = _get_or_create_queue("t-empty")
 
         with patch("server.grab_cookies_managed", return_value={
-            "cookies": {}, "auth_tokens": [], "headers": {}, "raw_requests": [],
+            "cookies": "", "auth_tokens": [], "headers": {}, "raw_requests": [],
         }):
             _run_grab_task("t-empty", "test.com")
 

@@ -15,8 +15,16 @@ Session CLI automates this via Chrome's remote debugging protocol (MCP). One com
 
 - **CLI + Web UI** — grab and view cookies from terminal or browser
 - **MCP protocol** — communicates with Chrome via the standard Chrome DevTools MCP adapter
-- **Encrypted vault** — all cookies stored in a Romek Vault, unlocked via OS keyring
-- **SSE streaming** — real-time progress in the Web UI
+- **Browser mode** — use existing Chrome (user browser) or launch a temporary Chrome instance
+- **Raw storage** — Cookies, auth tokens, and request headers stored as-is, no transformation
+- **Auth token scanning** — captures localStorage / sessionStorage entries (JWT, refresh tokens, etc.)
+- **Network headers** — captures request headers and raw request details from the page
+- **Related domains** — discovers and records third-party domains referenced in network requests
+- **Original URL** — stores the full URL for accurate refresh navigation
+- **Login detection** — detects redirect-to-login scenarios and reports clear error messages
+- **Encrypted vault** — all data stored in a Romek Vault, unlocked via OS keyring
+- **SSE streaming** — real-time progress + log streaming in the Web UI
+- **Graceful shutdown** — clean Ctrl+C exit, no tracebacks
 - **Single binary feel** — just `uv run python main.py`
 
 ## Quick Start
@@ -76,6 +84,7 @@ session-cli/
 ├── core/
 │   ├── __init__.py      # Public API
 │   ├── mcp.py           # Chrome DevTools MCP communication
+│   ├── mcp_manager.py   # MCP connection lifecycle + browser mode
 │   ├── vault.py         # Romek Vault encrypted persistence
 │   └── session.py       # Domain logic (grab + store)
 ├── main.py              # CLI entry point

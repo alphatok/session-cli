@@ -50,19 +50,20 @@ def cmd_grab(domain: str, auto_connect: bool):
         print(f"[✗] {e}")
         sys.exit(1)
 
-    cookies = data.get("cookies", {})
+    cookies = data.get("cookies", "")
     auth_tokens = data.get("auth_tokens", [])
     headers = data.get("headers", {})
     raw_requests = data.get("raw_requests", [])
     related_domains = data.get("related_domains", [])
+    cookie_count = cookies.count(";") + 1 if cookies else 0
 
     if not cookies and not auth_tokens and not headers:
         print("[✗] 未获取到 Cookie、认证凭据或请求头")
         sys.exit(1)
 
     rel_msg = f", {len(related_domains)} 个关联域名" if related_domains else ""
-    print(f"[✓] 获取到 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据, {len(headers)} 个公共 Header, {len(raw_requests)} 个原始请求{rel_msg}")
-    info = core.store_site(domain, data)
+    print(f"[✓] 获取到 {cookie_count} 个 Cookie, {len(auth_tokens)} 个认证凭据, {len(headers)} 个公共 Header, {len(raw_requests)} 个原始请求{rel_msg}")
+    info = core.store_site(domain, data, original_url=domain)
     print(f"[✓] 已存储到 vault: {info}")
 
 
@@ -77,12 +78,15 @@ def cmd_get(domain: str):
     print(f"[{status}] {site['domain']} | {site['cookie_count']} cookies | {site.get('auth_token_count', 0)} 认证凭据 | {hdr_count} headers | {raw_count} 原始请求")
     print(f"  创建: {site['created_at']}  过期: {site['expires_at']}")
 
-    # Cookie 列表
+    # 原始 URL
+    original_url = site.get("original_url", "")
+    if original_url:
+        print(f"  原始 URL: {original_url}")
+
+    # Cookie 原始字符串
     if site["cookies"]:
-        print("\nCookie 列表:")
-        for name, value in site["cookies"].items():
-            dv = value[:30] + "..." if len(value) > 30 else value
-            print(f"  {name} = {dv}")
+        print("\nCookie 原始字符串:")
+        print(f"  {site['cookies']}")
 
     # 认证凭据
     auth_tokens = site.get("auth_tokens", [])
@@ -131,7 +135,11 @@ def cmd_list():
         hdr_str = f", {hdr_count} headers" if hdr_count else ""
         rel_count = s.get("related_domain_count", 0)
         rel_str = f", {rel_count} 关联域" if rel_count else ""
-        print(f"  [{tag}] {s['domain']}  ({s['cookie_count']} cookies{at_str}{hdr_str}{rel_str})")
+        url_info = ""
+        if s.get("original_url"):
+            url_short = s["original_url"][:60] + "..." if len(s["original_url"]) > 60 else s["original_url"]
+            url_info = f"\n    URL: {url_short}"
+        print(f"  [{tag}] {s['domain']}  ({s['cookie_count']} cookies{at_str}{hdr_str}{rel_str}){url_info}")
 
 
 def cmd_delete(domain: str):

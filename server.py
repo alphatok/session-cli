@@ -39,6 +39,9 @@ _progress_lock = threading.Lock()
 _active_tasks: dict[str, threading.Event] = {}  # task_id → cancel_event
 _active_tasks_lock = threading.Lock()
 
+# 全局关闭信号（用于 SSE 生成器退出 + lifespan 清理）
+_shutdown_event = threading.Event()
+
 # ── 全局日志 ─────────────────────────────────────────────────
 
 _log_queue: queue.Queue = queue.Queue()
@@ -91,11 +94,12 @@ def _run_grab_task(task_id: str, domain: str):
     _emit_log("task", f"开始抓取: {domain}")
     try:
         data = grab_cookies_managed(domain, on_progress=on_progress, cancel_event=cancel_event)
-        cookies = data.get("cookies", {})
+        cookies = data.get("cookies", "")
         auth_tokens = data.get("auth_tokens", [])
         headers = data.get("headers", {})
         raw_requests = data.get("raw_requests", [])
         related_domains = data.get("related_domains", [])
+        cookie_count = cookies.count(";") + 1 if cookies else 0
         if not cookies and not auth_tokens and not headers:
             msg = "未获取到 Cookie、认证凭据和请求头，请确认已登录"
             q.put(json.dumps({"stage": "error", "detail": msg}))
@@ -103,7 +107,7 @@ def _run_grab_task(task_id: str, domain: str):
             return
         # 提取纯 domain 用于 Vault 存储 key
         store_domain = domain.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
-        core.store_site(store_domain, data)
+        core.store_site(store_domain, data, original_url=domain)
         parts = []
         if headers or raw_requests:
             parts.append(f"{len(headers)} 个公共 Header, {len(raw_requests)} 个原始请求")
@@ -112,14 +116,14 @@ def _run_grab_task(task_id: str, domain: str):
         hdr_msg = (", " + ", ".join(parts)) if parts else ""
         q.put(json.dumps({
             "stage": "completed",
-            "detail": f"成功存储 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据{hdr_msg}",
-            "count": len(cookies),
+            "detail": f"成功存储 {cookie_count} 个 Cookie, {len(auth_tokens)} 个认证凭据{hdr_msg}",
+            "count": cookie_count,
             "auth_count": len(auth_tokens),
             "header_count": len(headers),
             "raw_request_count": len(raw_requests),
             "related_domain_count": len(related_domains),
         }))
-        _emit_log("completed", f"抓取完成: {domain} ({len(cookies)} cookies, {len(auth_tokens)} tokens)")
+        _emit_log("completed", f"抓取完成: {domain} ({cookie_count} cookies, {len(auth_tokens)} tokens)")
     except Exception as e:
         msg = str(e)
         if cancel_event.is_set():
@@ -140,6 +144,8 @@ def _run_grab_task(task_id: str, domain: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """启动 / 关闭时管理 Vault + MCP 生命周期。"""
+    # 重置关闭信号（从上一次运行的残留中恢复）
+    _shutdown_event.clear()
     try:
         vault = core.get_vault()
         vault.list_sessions()  # 验证 vault 可用
@@ -152,21 +158,39 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # 清理：关闭 MCP 连接 + SSE 队列 + 取消活跃任务
         print("[*] 正在关闭服务...")
+        # 1. 通知所有 SSE 生成器退出
+        _shutdown_event.set()
+        # 2. 取消所有活跃的抓取任务
         with _active_tasks_lock:
             for evt in _active_tasks.values():
                 evt.set()
             _active_tasks.clear()
+        # 3. 直接终止 MCP 进程（避免 mgr.disconnect() 阻塞在 _comm_lock 上）
         try:
             mgr = McpManager.get_instance()
             if mgr.is_connected():
-                mgr.disconnect()
+                # 直接 kill，不等待锁
+                proc = mgr._proc
+                if proc is not None:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                mgr._proc = None
+                mgr._stop_monitor()
                 print("[✓] MCP 连接已关闭")
         except Exception:
             pass
+        # 4. 清理 SSE 队列
         with _progress_lock:
             _progress_queues.clear()
+        # 5. 短暂等待 SSE 生成器退出
+        await asyncio.sleep(0.2)
         print("[✓] 服务已关闭")
 
 
@@ -214,9 +238,9 @@ async def api_grab_progress(task_id: str = Query(...)):
     q = _get_or_create_queue(task_id)
 
     async def event_stream():
-        while True:
+        while not _shutdown_event.is_set():
             try:
-                msg = q.get(timeout=0.1)
+                msg = await asyncio.to_thread(q.get, True, 0.1)
                 yield f"data: {msg}\n\n"
                 data = json.loads(msg)
                 if data.get("stage") in ("completed", "error", "cancelled"):
@@ -256,8 +280,12 @@ async def api_refresh_session(domain: str):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+    # 使用原始 URL（如果存储过），否则回退到域名
+    site = core.get_site(domain)
+    target_url = (site.get("original_url") if site and site.get("original_url") else domain) if site else domain
+
     task_id = uuid.uuid4().hex[:8]
-    thread = threading.Thread(target=_run_grab_task, args=(task_id, domain), daemon=True)
+    thread = threading.Thread(target=_run_grab_task, args=(task_id, target_url), daemon=True)
     thread.start()
 
     return {"task_id": task_id, "status": "started", "domain": domain}
@@ -292,9 +320,9 @@ async def api_logs_stream():
             for entry in _log_history:
                 yield f"data: {json.dumps(entry)}\n\n"
         # 持续推送新日志
-        while True:
+        while not _shutdown_event.is_set():
             try:
-                entry = _log_queue.get(timeout=0.5)
+                entry = await asyncio.to_thread(_log_queue.get, True, 0.5)
                 yield f"data: {json.dumps(entry)}\n\n"
             except queue.Empty:
                 yield ": keepalive\n\n"

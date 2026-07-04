@@ -249,6 +249,10 @@ RAW_PREFIX = "__raw__"
 REL_PREFIX = "__rel__"
 """Vault 中 related_domains JSON blob 的键名前缀。"""
 
+RAW_COOKIE_KEY = "__raw__cookie"
+URL_KEY = "__original_url__"
+"""Vault 中原始 cookie 字符串的键名。"""
+
 
 class GrabCancelled(Exception):
     """抓取操作被取消（用户取消或超时）。"""
@@ -287,6 +291,22 @@ def _extract_markdown_json_obj(text: str) -> Optional[dict]:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
+            pass
+
+    # 策略 2.5: 匹配 ```json ... ``` 块中 double-encoded 的 JSON 字符串
+    # evaluate_script 会将 JS 返回值 double-encode：
+    #   JS 返回: {"cookies": [...]}
+    #   MCP 包装: "{\"cookies\": [...]}"
+    # 需要先解码外层字符串，再解析内层 JSON 对象
+    m = re.search(r'```(?:json)?\s*\n\s*"(.+?)"\s*\n```', text, re.DOTALL)
+    if m:
+        try:
+            inner = json.loads('"' + m.group(1) + '"')
+            if isinstance(inner, str):
+                obj = json.loads(inner)
+                if isinstance(obj, dict):
+                    return obj
+        except (json.JSONDecodeError, Exception):
             pass
 
     # 策略 3: 提取文本中任意位置的 JSON 对象
@@ -621,74 +641,33 @@ def _grab_network_headers(
 
     _check_cancelled()
 
-    # Step 3: 分析公共 Header
-    common = _compute_common_headers(raw_requests)
+    progress("network_done", f"捕获 {len(raw_requests)} 个原始请求, {len(related_domains)} 个关联域名")
 
-    if common:
-        progress("network_done", f"分析完成：{len(common)} 个公共 Header，{len(raw_requests)} 个原始请求，{len(related_domains)} 个关联域名")
-    else:
-        progress("network_done", f"捕获 {len(raw_requests)} 个请求，未检测到公共 Header，{len(related_domains)} 个关联域名")
-
-    return common, raw_requests, related_domains
+    return {}, raw_requests, related_domains
 
 
 # ── 增强版 Cookie + 凭据采集 JS 脚本 ───────────────────────────
 
 _GRAB_JS = r"""() => {
     var result = {
-        cookies: [],
-        storage: {localStorage: {}, sessionStorage: {}}
+        cookie: document.cookie || '',
+        localStorage: {},
+        sessionStorage: {}
     };
 
-    // ── 1. 采集所有 document.cookie ──
-    if (document.cookie) {
-        var pairs = document.cookie.split(';');
-        for (var i = 0; i < pairs.length; i++) {
-            var p = pairs[i].trim();
-            if (!p) continue;
-            var eq = p.indexOf('=');
-            if (eq > 0) {
-                result.cookies.push({
-                    name: p.substring(0, eq),
-                    value: p.substring(eq + 1)
-                });
-            }
-        }
-    }
-
-    // ── 2. 认证相关关键词模式 ──
-    var patterns = [
-        'token', 'auth', 'jwt', 'bearer', 'access', 'refresh',
-        'session', 'id_token', 'api_key', 'apikey', 'secret',
-        'credential', 'authorization', 'csrf', 'xsrf', '_csrf',
-        '_token', 'oauth', 'sso', 'login', 'key', 'pass'
-    ];
-
-    function isAuthKey(k) {
-        var lower = k.toLowerCase();
-        for (var i = 0; i < patterns.length; i++) {
-            if (lower.indexOf(patterns[i]) !== -1) return true;
-        }
-        return false;
-    }
-
-    // ── 3. 扫描 localStorage ──
+    // 采集所有 localStorage 条目
     try {
         for (var i = 0; i < localStorage.length; i++) {
             var key = localStorage.key(i);
-            if (isAuthKey(key)) {
-                result.storage.localStorage[key] = localStorage.getItem(key);
-            }
+            result.localStorage[key] = localStorage.getItem(key);
         }
     } catch (e) {}
 
-    // ── 4. 扫描 sessionStorage ──
+    // 采集所有 sessionStorage 条目
     try {
         for (var i = 0; i < sessionStorage.length; i++) {
             var key = sessionStorage.key(i);
-            if (isAuthKey(key)) {
-                result.storage.sessionStorage[key] = sessionStorage.getItem(key);
-            }
+            result.sessionStorage[key] = sessionStorage.getItem(key);
         }
     } catch (e) {}
 
@@ -855,26 +834,22 @@ def _grab_cookies_impl(
         progress("done", f"获取到 {len(result)} 个 Cookie")
         return {"cookies": result, "auth_tokens": [], "headers": common_headers, "raw_requests": raw_requests, "related_domains": related_domains}
 
-    # 提取 Cookie 名值对
-    cookies: Dict[str, str] = {}
-    for c in data.get("cookies", []):
-        if isinstance(c, dict) and "name" in c:
-            cookies[c["name"]] = c.get("value", "")
+    # 原始存取：直接取 cookie 字符串和全量 localStorage/sessionStorage
+    raw_cookie = data.get("cookie", "") or ""
+    raw_ls = data.get("localStorage", {}) or {}
+    raw_ss = data.get("sessionStorage", {}) or {}
 
-    # 提取认证凭据
+    # 构建 auth_tokens：所有 localStorage/sessionStorage 条目，原始存储
     auth_tokens: list = []
-    storage = data.get("storage", {})
-    for source, label in [("localStorage", "ls"), ("sessionStorage", "ss")]:
-        for key, value in storage.get(source, {}).items():
-            if value:
-                auth_tokens.append({
-                    "source": source,
-                    "key": key,
-                    "value": value,
-                })
+    for key, value in raw_ls.items():
+        if value:
+            auth_tokens.append({"source": "localStorage", "key": key, "value": value})
+    for key, value in raw_ss.items():
+        if value:
+            auth_tokens.append({"source": "sessionStorage", "key": key, "value": value})
 
-    progress("done", f"获取到 {len(cookies)} 个 Cookie, {len(auth_tokens)} 个认证凭据, {len(common_headers)} 个公共 Header, {len(related_domains)} 个关联域名")
-    return {"cookies": cookies, "auth_tokens": auth_tokens, "headers": common_headers, "raw_requests": raw_requests, "related_domains": related_domains}
+    progress("done", f"获取到 Cookie 原始字符串, {len(auth_tokens)} 个存储凭据, {len(common_headers)} 个公共 Header, {len(related_domains)} 个关联域名")
+    return {"cookies": raw_cookie, "auth_tokens": auth_tokens, "headers": common_headers, "raw_requests": raw_requests, "related_domains": related_domains}
 
 
 def grab_cookies(

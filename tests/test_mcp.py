@@ -176,38 +176,36 @@ class TestExtractMarkdownJsonObj:
         """从 Markdown 中提取 JSON 对象。"""
         result = _extract_markdown_json_obj(sample_mcp_grab_json)
         assert result is not None
-        assert "cookies" in result
-        assert len(result["cookies"]) == 2
-        assert result["cookies"][0]["name"] == "token"
-        assert result["cookies"][0]["value"] == "abc123"
-        assert result["storage"]["localStorage"]["auth_token"] == "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"
+        assert "cookie" in result
+        assert result["cookie"] == "token=abc123; session=xyz789"
+        assert result["localStorage"]["auth_token"] == "Bearer eyJhbGciOiJIUzI1NiJ9.xxx"
 
     def test_parses_auth_tokens(self, sample_mcp_grab_json):
         """auth_token 从 localStorage 正确提取。"""
         result = _extract_markdown_json_obj(sample_mcp_grab_json)
-        assert "refresh_token" in result["storage"]["localStorage"]
-        assert result["storage"]["localStorage"]["refresh_token"] == "rt_abc123"
+        assert "refresh_token" in result["localStorage"]
+        assert result["localStorage"]["refresh_token"] == "rt_abc123"
 
     def test_json_without_language_tag(self):
         """无 json 语言标记的 code block 也可解析。"""
-        text = '```\n{"cookies":[{"name":"a","value":"1"}]}\n```'
+        text = '```\n{"cookie":"a=1","localStorage":{},"sessionStorage":{}}\n```'
         result = _extract_markdown_json_obj(text)
         assert result is not None
-        assert result["cookies"][0]["name"] == "a"
+        assert result["cookie"] == "a=1"
 
     def test_empty_storage(self):
         """空 localStorage/sessionStorage 返回空 dict。"""
-        text = '```json\n{"cookies":[],"storage":{"localStorage":{},"sessionStorage":{}}}\n```'
+        text = '```json\n{"cookie":"","localStorage":{},"sessionStorage":{}}\n```'
         result = _extract_markdown_json_obj(text)
         assert result is not None
-        assert result["storage"]["localStorage"] == {}
+        assert result["localStorage"] == {}
 
     def test_falls_back_to_regex_pattern(self):
         """非标准格式的回退解析（策略 3/4）。"""
-        text = 'Some prefix text {"cookies":[{"name":"x","value":"y"}]} some suffix'
+        text = 'Some prefix text {"cookie":"token=abc; uid=123","localStorage":{},"sessionStorage":{}} some suffix'
         result = _extract_markdown_json_obj(text)
         assert result is not None
-        assert result["cookies"][0]["name"] == "x"
+        assert result["cookie"] == "token=abc; uid=123"
 
     def test_non_string_returns_none(self):
         assert _extract_markdown_json_obj(None) is None
@@ -238,8 +236,8 @@ class TestGrabCookiesIntegration:
         cookie_text = (
             'Script ran on page and returned:\n'
             '```json\n'
-            '{"cookies":[{"name":"token","value":"abc"},{"name":"uid","value":"123"}],'
-            '"storage":{"localStorage":{"auth_key":"secret123"},"sessionStorage":{}}}'
+            '{"cookie":"token=abc; uid=123",'
+            '"localStorage":{"auth_key":"secret123"},"sessionStorage":{}}'
             '\n```'
         )
 
@@ -270,8 +268,7 @@ class TestGrabCookiesIntegration:
         assert "headers" in result
         assert "raw_requests" in result
         assert "related_domains" in result
-        assert len(result["cookies"]) == 2
-        assert result["cookies"]["token"] == "abc"
+        assert result["cookies"] == "token=abc; uid=123"
         assert len(result["auth_tokens"]) == 1
         assert result["auth_tokens"][0]["key"] == "auth_key"
         assert result["auth_tokens"][0]["source"] == "localStorage"
