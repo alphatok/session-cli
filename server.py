@@ -34,6 +34,10 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 _progress_queues: dict[str, queue.Queue] = {}
 _progress_lock = threading.Lock()
 
+# 活跃任务追踪（用于取消操作）
+_active_tasks: dict[str, threading.Event] = {}  # task_id → cancel_event
+_active_tasks_lock = threading.Lock()
+
 
 def _get_or_create_queue(task_id: str) -> queue.Queue:
     with _progress_lock:
@@ -51,17 +55,21 @@ def _cleanup_queue(task_id: str) -> None:
 def _run_grab_task(task_id: str, domain: str):
     """后台线程执行 cookie 抓取（通过 McpManager 长连接）。"""
     q = _get_or_create_queue(task_id)
+    cancel_event = threading.Event()
+
+    # 注册任务
+    with _active_tasks_lock:
+        _active_tasks[task_id] = cancel_event
 
     def on_progress(stage, detail):
         q.put(json.dumps({"stage": stage, "detail": detail}))
 
     try:
-        data = grab_cookies_managed(domain, on_progress=on_progress)
+        data = grab_cookies_managed(domain, on_progress=on_progress, cancel_event=cancel_event)
         cookies = data.get("cookies", {})
         auth_tokens = data.get("auth_tokens", [])
         if not cookies and not auth_tokens:
             q.put(json.dumps({"stage": "error", "detail": "未获取到 Cookie 和认证凭据，请确认已登录"}))
-            _cleanup_queue(task_id)
             return
         core.store_site(domain, data)
         q.put(json.dumps({
@@ -71,8 +79,15 @@ def _run_grab_task(task_id: str, domain: str):
             "auth_count": len(auth_tokens),
         }))
     except Exception as e:
-        q.put(json.dumps({"stage": "error", "detail": str(e)}))
+        msg = str(e)
+        if cancel_event.is_set():
+            q.put(json.dumps({"stage": "cancelled", "detail": msg}))
+        else:
+            q.put(json.dumps({"stage": "error", "detail": msg}))
     finally:
+        # 清理
+        with _active_tasks_lock:
+            _active_tasks.pop(task_id, None)
         _cleanup_queue(task_id)
 
 
@@ -89,7 +104,11 @@ async def lifespan(app: FastAPI):
         print(f"[!] Vault 解锁失败: {e}")
         print("[!] 请先执行: uv run python main.py init")
     yield
-    # 清理：关闭 MCP 连接 + SSE 队列
+    # 清理：关闭 MCP 连接 + SSE 队列 + 取消活跃任务
+    with _active_tasks_lock:
+        for evt in _active_tasks.values():
+            evt.set()
+        _active_tasks.clear()
     try:
         mgr = McpManager.get_instance()
         if mgr.is_connected():
@@ -150,7 +169,7 @@ async def api_grab_progress(task_id: str = Query(...)):
                 msg = q.get(timeout=0.1)
                 yield f"data: {msg}\n\n"
                 data = json.loads(msg)
-                if data.get("stage") in ("completed", "error"):
+                if data.get("stage") in ("completed", "error", "cancelled"):
                     break
             except queue.Empty:
                 yield ": keepalive\n\n"
@@ -194,6 +213,17 @@ async def api_refresh_session(domain: str):
     return {"task_id": task_id, "status": "started", "domain": domain}
 
 
+@app.post("/api/sessions/grab/{task_id}/cancel")
+async def api_cancel_grab(task_id: str):
+    """取消正在进行的抓取/刷新任务。"""
+    with _active_tasks_lock:
+        cancel_event = _active_tasks.get(task_id)
+        if cancel_event is None:
+            return JSONResponse({"error": "任务不存在或已完成"}, status_code=404)
+        cancel_event.set()
+    return {"status": "cancelling", "task_id": task_id}
+
+
 # ── MCP 连接管理 ─────────────────────────────────────────────
 
 @app.get("/api/mcp/status")
@@ -205,13 +235,18 @@ async def api_mcp_status():
 
 @app.post("/api/mcp/connect")
 async def api_mcp_connect():
-    """手动连接 MCP。"""
+    """手动连接 MCP（含 CDP 健康检查）。"""
     mgr = McpManager.get_instance()
     if mgr.is_connected():
-        return {"status": "already_connected"}
+        ok, msg = mgr.health_check()
+        if ok:
+            return {"status": "already_connected", "cdp_status": msg}
+        else:
+            # CDP 已断开，尝试重连
+            mgr.disconnect()
     try:
         mgr.connect()
-        return {"status": "connected"}
+        return {"status": "connected", "cdp_status": "CDP 连接正常"}
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

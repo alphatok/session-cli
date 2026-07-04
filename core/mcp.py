@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from typing import Callable, Dict, Optional
 
@@ -167,6 +168,11 @@ AUTH_PREFIX = "__auth__"
 """Vault 中 auth token 条目的键名前缀，避免与真实 Cookie 名冲突。"""
 
 
+class GrabCancelled(Exception):
+    """抓取操作被取消（用户取消或超时）。"""
+    pass
+
+
 def _extract_markdown_json_obj(text: str) -> Optional[dict]:
     """从 evaluate_script 返回的 Markdown 中提取 JSON 对象。
 
@@ -290,6 +296,7 @@ def _grab_cookies_impl(
     proc,  # subprocess.Popen
     domain: str,
     on_progress: Optional[Callable[[str, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """在已连接的 MCP 进程上执行 Cookie + 认证凭据抓取。
 
@@ -299,20 +306,28 @@ def _grab_cookies_impl(
         proc: 已初始化握手的 MCP subprocess.Popen 进程
         domain: 清理后的目标域名
         on_progress: 可选进度回调
+        cancel_event: 可选 threading.Event，外部 set 后中断本次抓取
 
     Returns:
         {"cookies": Dict, "auth_tokens": List[dict]}
 
     Raises:
         RuntimeError: Cookie 为空或通信失败
+        GrabCancelled: 操作被外部取消
     """
     def progress(stage: str, detail: str = ""):
         if on_progress:
             on_progress(stage, detail)
 
+    def _check_cancelled():
+        if cancel_event and cancel_event.is_set():
+            raise GrabCancelled("操作已被取消")
+
     # Step 1: 列出页面
+    _check_cancelled()
     progress("listing", "获取页面列表...")
     resp = _jsonrpc_send(proc, "tools/call", {"name": "list_pages", "arguments": {}})
+    _check_cancelled()
     pages_text = _extract_result(resp)
 
     # 从 Markdown 中匹配目标域名
@@ -327,6 +342,7 @@ def _grab_cookies_impl(
                     break
 
     # Step 2: 选择或导航
+    _check_cancelled()
     if target_idx is not None:
         if target_idx > 0:
             progress("selecting", "切换到目标页面...")
@@ -334,6 +350,7 @@ def _grab_cookies_impl(
                 "name": "select_page",
                 "arguments": {"pageIdx": target_idx},
             })
+            _check_cancelled()
             time.sleep(1)
     else:
         progress("navigating", f"导航到 https://{domain} ...")
@@ -341,9 +358,11 @@ def _grab_cookies_impl(
             "name": "navigate_page",
             "arguments": {"type": "url", "url": f"https://{domain}"},
         })
+        _check_cancelled()
         time.sleep(5)
 
     # Step 3: 执行增强版 JS 采集 Cookie + localStorage + sessionStorage
+    _check_cancelled()
     progress("evaluating", "采集 Cookie + 认证凭据...")
     resp = _jsonrpc_send(proc, "tools/call", {
         "name": "evaluate_script",

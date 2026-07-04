@@ -89,7 +89,8 @@ class TestMcpManagerStatus:
         mgr = McpManager.get_instance()
         with patch("core.mcp_manager._start_mcp_server", return_value=mock_mcp_process):
             with patch("core.mcp_manager.time.sleep", return_value=None):
-                mgr.connect()
+                with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                    mgr.connect()
 
         assert mgr.is_connected() is True
         status = mgr.get_status()
@@ -106,7 +107,8 @@ class TestMcpManagerConnectDisconnect:
         mgr = McpManager.get_instance()
         with patch("core.mcp_manager._start_mcp_server", return_value=mock_mcp_process):
             with patch("core.mcp_manager.time.sleep", return_value=None):
-                mgr.connect()
+                with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                    mgr.connect()
 
         assert mgr.is_connected() is True
         assert mgr._monitor_running is True
@@ -116,7 +118,8 @@ class TestMcpManagerConnectDisconnect:
         mgr = McpManager.get_instance()
         with patch("core.mcp_manager._start_mcp_server", return_value=mock_mcp_process):
             with patch("core.mcp_manager.time.sleep", return_value=None):
-                mgr.connect()
+                with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                    mgr.connect()
         mgr.disconnect()
 
         assert mgr.is_connected() is False
@@ -128,11 +131,13 @@ class TestMcpManagerConnectDisconnect:
         mgr = McpManager.get_instance()
         with patch("core.mcp_manager._start_mcp_server", return_value=mock_mcp_process):
             with patch("core.mcp_manager.time.sleep", return_value=None):
-                mgr.connect()
+                with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                    mgr.connect()
                 first_proc = mgr.get_proc()
 
                 # 再次连接
-                mgr.connect()
+                with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                    mgr.connect()
                 second_proc = mgr.get_proc()
 
         # 旧进程被 terminate
@@ -152,7 +157,8 @@ class TestMcpManagerIdleTimeout:
         """空闲超过 10 分钟自动断开。"""
         mgr = McpManager.get_instance()
         with patch("core.mcp_manager._start_mcp_server", return_value=mock_mcp_process):
-            mgr.connect()
+            with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                mgr.connect()
 
         # 模拟超时：设置 last_activity 为 601 秒前
         mgr._last_activity = time.time() - 601
@@ -168,7 +174,8 @@ class TestMcpManagerIdleTimeout:
         """空闲未超时时不断开。"""
         mgr = McpManager.get_instance()
         with patch("core.mcp_manager._start_mcp_server", return_value=mock_mcp_process):
-            mgr.connect()
+            with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                mgr.connect()
 
         # 设置 last_activity 为刚发生
         mgr._last_activity = time.time()
@@ -191,9 +198,10 @@ class TestMcpManagerCommLock:
     """通信锁测试。"""
 
     def test_comm_lock_is_threading_lock(self):
-        """_comm_lock 是 threading.Lock 实例。"""
+        """_comm_lock 是 threading.RLock 实例。"""
         mgr = McpManager.get_instance()
-        assert isinstance(mgr._comm_lock, type(threading.Lock()))
+        from threading import RLock
+        assert isinstance(mgr._comm_lock, RLock)
 
     def test_acquire_comm_lock_returns_same_lock(self):
         """acquire_comm_lock 返回正确的锁。"""
@@ -210,7 +218,8 @@ class TestMcpManagerBumpActivity:
         mgr = McpManager.get_instance()
         with patch("core.mcp_manager._start_mcp_server", return_value=mock_mcp_process):
             with patch("core.mcp_manager.time.sleep", return_value=None):
-                mgr.connect()
+                with patch.object(mgr, "health_check", return_value=(True, "ok")):
+                    mgr.connect()
 
         old_time = mgr._last_activity
         time.sleep(0.01)

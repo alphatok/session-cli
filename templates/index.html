@@ -170,12 +170,15 @@
                 placeholder="输入域名，如 yuanbao.tencent.com"
                 onkeydown="if(event.key==='Enter') startGrab()"
             >
-            <button class="btn btn-primary" onclick="startGrab()">
+            <button class="btn btn-primary" onclick="startGrab()" id="btn-grab">
                 抓取 Cookie
             </button>
         </div>
         <div id="progress" class="progress">
-            <span id="progress-text" class="progress-text">准备中...</span>
+            <div style="display:flex;align-items:center;gap:10px">
+                <span id="progress-text" class="progress-text" style="flex:1">准备中...</span>
+                <button class="btn btn-sm btn-danger" id="btn-stop" onclick="stopGrab()" style="display:none">停止</button>
+            </div>
             <div class="progress-bar">
                 <div id="progress-fill" class="progress-fill"></div>
             </div>
@@ -197,6 +200,15 @@
 <script>
 let currentTaskId = null;
 let currentEventSource = null;
+let currentRefreshDomain = null;  // 当前正在刷新的域名
+
+function stopGrab() {
+    if (!currentTaskId) return;
+    document.getElementById('progress-text').textContent = '正在停止...';
+    document.getElementById('btn-stop').disabled = true;
+    fetch(`/api/sessions/grab/${currentTaskId}/cancel`, { method: 'POST' })
+        .catch(() => {});
+}
 
 function startGrab() {
     const domain = document.getElementById('domain-input').value.trim();
@@ -205,9 +217,17 @@ function startGrab() {
     const progress = document.getElementById('progress');
     const progressText = document.getElementById('progress-text');
     const progressFill = document.getElementById('progress-fill');
+    const btnGrab = document.getElementById('btn-grab');
+    const btnStop = document.getElementById('btn-stop');
     progress.classList.add('active');
     progressText.textContent = '正在启动...';
     progressFill.style.width = '0%';
+    progressFill.style.background = 'var(--accent)';
+    currentRefreshDomain = null;
+    btnGrab.textContent = '抓取中...';
+    btnGrab.disabled = true;
+    btnStop.style.display = '';
+    btnStop.disabled = false;
 
     // Close previous SSE
     if (currentEventSource) currentEventSource.close();
@@ -217,7 +237,7 @@ function startGrab() {
         .then(data => {
             if (data.error) {
                 showToast(data.error, 'error');
-                progress.classList.remove('active');
+                resetGrabButton();
                 return;
             }
             currentTaskId = data.task_id;
@@ -225,8 +245,20 @@ function startGrab() {
         })
         .catch(e => {
             showToast('请求失败: ' + e.message, 'error');
-            progress.classList.remove('active');
+            resetGrabButton();
         });
+}
+
+function resetGrabButton() {
+    const progress = document.getElementById('progress');
+    const btnGrab = document.getElementById('btn-grab');
+    const btnStop = document.getElementById('btn-stop');
+    progress.classList.remove('active');
+    btnGrab.textContent = '抓取 Cookie';
+    btnGrab.disabled = false;
+    btnStop.style.display = 'none';
+    currentTaskId = null;
+    currentRefreshDomain = null;
 }
 
 function listenProgress(taskId) {
@@ -248,17 +280,46 @@ function listenProgress(taskId) {
             progressFill.style.width = '100%';
             progressText.textContent = data.detail;
             setTimeout(() => {
-                progress.classList.remove('active');
+                resetGrabButton();
+                // 如果有刷新域名，重置刷新按钮
+                if (currentRefreshDomain) {
+                    const encDom = encodeURIComponent(currentRefreshDomain);
+                    const btn = document.getElementById('refresh-btn-' + encDom);
+                    if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+                }
                 htmx.trigger('#session-list', 'refresh-sessions');
                 showToast(data.detail, 'success');
-                updateMcpStatus();  // 刷新 MCP 状态
+                updateMcpStatus();
             }, 800);
             currentEventSource.close();
         }
         if (data.stage === 'error') {
             progressFill.style.background = 'var(--red)';
             progressText.textContent = '✗ ' + data.detail;
-            setTimeout(() => progress.classList.remove('active'), 3000);
+            setTimeout(() => {
+                resetGrabButton();
+                if (currentRefreshDomain) {
+                    const encDom = encodeURIComponent(currentRefreshDomain);
+                    const btn = document.getElementById('refresh-btn-' + encDom);
+                    if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+                }
+                progressFill.style.background = 'var(--accent)';
+            }, 3000);
+            showToast(data.detail, 'error');
+            currentEventSource.close();
+        }
+        if (data.stage === 'cancelled') {
+            progressFill.style.background = 'var(--orange)';
+            progressText.textContent = '⏹ ' + data.detail;
+            setTimeout(() => {
+                resetGrabButton();
+                if (currentRefreshDomain) {
+                    const encDom = encodeURIComponent(currentRefreshDomain);
+                    const btn = document.getElementById('refresh-btn-' + encDom);
+                    if (btn) { btn.disabled = false; btn.textContent = '更新'; }
+                }
+                progressFill.style.background = 'var(--accent)';
+            }, 3000);
             showToast(data.detail, 'error');
             currentEventSource.close();
         }
@@ -266,7 +327,7 @@ function listenProgress(taskId) {
 
     currentEventSource.onerror = () => {
         if (currentEventSource.readyState === EventSource.CLOSED) {
-            progress.classList.remove('active');
+            resetGrabButton();
         }
     };
 }
@@ -426,9 +487,17 @@ function refreshSession(domain) {
     const progress = document.getElementById('progress');
     const progressText = document.getElementById('progress-text');
     const progressFill = document.getElementById('progress-fill');
+    const btnGrab = document.getElementById('btn-grab');
+    const btnStop = document.getElementById('btn-stop');
     progress.classList.add('active');
     progressText.textContent = '正在更新 ' + domain + ' ...';
     progressFill.style.width = '0%';
+    progressFill.style.background = 'var(--accent)';
+    currentRefreshDomain = domain;
+    btnGrab.textContent = '抓取中...';
+    btnGrab.disabled = true;
+    btnStop.style.display = '';
+    btnStop.disabled = false;
 
     if (currentEventSource) currentEventSource.close();
 
@@ -437,69 +506,18 @@ function refreshSession(domain) {
         .then(data => {
             if (data.error) {
                 showToast(data.error, 'error');
-                progress.classList.remove('active');
+                resetGrabButton();
                 if (btn) { btn.disabled = false; btn.textContent = '更新'; }
                 return;
             }
             currentTaskId = data.task_id;
-            listenProgressRef(data.task_id, domain);
+            listenProgress(data.task_id);
         })
         .catch(e => {
             showToast('更新失败: ' + e.message, 'error');
-            progress.classList.remove('active');
+            resetGrabButton();
             if (btn) { btn.disabled = false; btn.textContent = '更新'; }
         });
-}
-
-function listenProgressRef(taskId, domain) {
-    const progressText = document.getElementById('progress-text');
-    const progressFill = document.getElementById('progress-fill');
-    const progress = document.getElementById('progress');
-    const encDom = encodeURIComponent(domain);
-    const btn = document.getElementById('refresh-btn-' + encDom);
-
-    const stages = { waiting: 15, listing: 30, found: 45, selecting: 50, navigating: 55, evaluating: 80, done: 95 };
-
-    currentEventSource = new EventSource(`/api/sessions/grab/progress?task_id=${taskId}`);
-
-    currentEventSource.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        progressText.textContent = data.detail;
-        const pct = stages[data.stage] || 50;
-        progressFill.style.width = pct + '%';
-
-        if (data.stage === 'completed') {
-            progressFill.style.width = '100%';
-            progressText.textContent = data.detail;
-            setTimeout(() => {
-                progress.classList.remove('active');
-                htmx.trigger('#session-list', 'refresh-sessions');
-                showToast(domain + ' 更新完成', 'success');
-                if (btn) { btn.disabled = false; btn.textContent = '更新'; }
-                // 更新 MCP 状态（idle 计时会重置）
-                updateMcpStatus();
-            }, 800);
-            currentEventSource.close();
-        }
-        if (data.stage === 'error') {
-            progressFill.style.background = 'var(--red)';
-            progressText.textContent = '✗ ' + data.detail;
-            setTimeout(() => {
-                progress.classList.remove('active');
-                progressFill.style.background = 'var(--accent)';
-                if (btn) { btn.disabled = false; btn.textContent = '更新'; }
-            }, 3000);
-            showToast(data.detail, 'error');
-            currentEventSource.close();
-        }
-    };
-
-    currentEventSource.onerror = () => {
-        if (currentEventSource.readyState === EventSource.CLOSED) {
-            progress.classList.remove('active');
-            if (btn) { btn.disabled = false; btn.textContent = '更新'; }
-        }
-    };
 }
 
 // ── 初始化 ────────────────────────────────────────────────
