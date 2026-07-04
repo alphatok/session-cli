@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session Manager</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.2.1/sse.js"></script>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --surface: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-dim: #8b949e;
+            --accent: #58a6ff;
+            --green: #3fb950;
+            --red: #f85149;
+            --orange: #d2991d;
+            --radius: 8px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: var(--bg); color: var(--text);
+            min-height: 100vh; padding: 24px;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { font-size: 22px; margin-bottom: 24px; display: flex; align-items: center; gap: 10px; }
+        .badge { font-size: 12px; padding: 3px 8px; border-radius: 12px; }
+        .badge-ok { background: var(--green); color: #000; }
+        .badge-warn { background: var(--orange); color: #000; }
+
+        /* Card */
+        .card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 20px; margin-bottom: 20px;
+        }
+        .card h2 { font-size: 16px; margin-bottom: 14px; color: var(--accent); }
+
+        /* Add form */
+        .add-row { display: flex; gap: 10px; }
+        .add-row input {
+            flex: 1; padding: 10px 14px; border-radius: var(--radius);
+            border: 1px solid var(--border); background: var(--bg); color: var(--text);
+            font-size: 14px; outline: none;
+        }
+        .add-row input:focus { border-color: var(--accent); }
+        .btn {
+            padding: 10px 18px; border-radius: var(--radius); border: none;
+            font-size: 14px; cursor: pointer; font-weight: 500; transition: opacity .2s;
+        }
+        .btn:hover { opacity: .85; }
+        .btn-primary { background: var(--accent); color: #000; }
+        .btn-danger { background: transparent; border: 1px solid var(--red); color: var(--red); }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+
+        /* Progress */
+        .progress { margin-top: 12px; display: none; }
+        .progress.active { display: block; }
+        .progress-bar {
+            height: 4px; background: var(--border); border-radius: 2px;
+            margin-top: 8px; overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%; background: var(--accent); border-radius: 2px;
+            width: 0%; transition: width .3s;
+        }
+        .progress-text { font-size: 13px; color: var(--text-dim); margin-top: 4px; }
+
+        /* Session list */
+        .session-item {
+            display: flex; align-items: center; gap: 12px;
+            padding: 14px 0; border-bottom: 1px solid var(--border);
+        }
+        .session-item:last-child { border-bottom: none; }
+        .session-icon { font-size: 18px; }
+        .session-info { flex: 1; }
+        .session-domain { font-weight: 600; font-size: 14px; }
+        .session-meta { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+        .session-tag {
+            font-size: 11px; padding: 2px 7px; border-radius: 10px;
+        }
+        .tag-expired { background: var(--red); color: #fff; }
+        .tag-active { background: var(--green); color: #000; }
+        .session-actions { display: flex; gap: 6px; }
+
+        /* Detail modal */
+        .detail-row {
+            display: flex; padding: 6px 0; border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }
+        .detail-name { width: 180px; color: var(--accent); flex-shrink: 0; }
+        .detail-value { word-break: break-all; max-width: 400px; }
+        .empty-state { text-align: center; padding: 40px; color: var(--text-dim); font-size: 14px; }
+
+        /* Toast */
+        .toast {
+            position: fixed; top: 20px; right: 20px; padding: 12px 20px;
+            border-radius: var(--radius); font-size: 14px; z-index: 100;
+            animation: slideIn .3s ease;
+        }
+        .toast-success { background: var(--green); color: #000; }
+        .toast-error { background: var(--red); color: #fff; }
+        @keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>
+        🔑 Session Manager
+        <span class="badge badge-ok">v1.0</span>
+    </h1>
+
+    <!-- ====== 添加站点 ====== -->
+    <div class="card">
+        <h2>➕ 添加新站点</h2>
+        <div class="add-row">
+            <input
+                type="text" id="domain-input" name="domain"
+                placeholder="输入域名，如 yuanbao.tencent.com"
+                onkeydown="if(event.key==='Enter') startGrab()"
+            >
+            <button class="btn btn-primary" onclick="startGrab()">
+                抓取 Cookie
+            </button>
+        </div>
+        <div id="progress" class="progress">
+            <span id="progress-text" class="progress-text">准备中...</span>
+            <div class="progress-bar">
+                <div id="progress-fill" class="progress-fill"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ====== 站点列表 ====== -->
+    <div class="card">
+        <h2>📋 已存储站点</h2>
+        <div id="session-list"
+             hx-get="/api/sessions"
+             hx-trigger="load, every:30s, refresh-sessions from:body"
+             hx-swap="innerHTML">
+            <div class="empty-state">加载中...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentTaskId = null;
+let currentEventSource = null;
+
+function startGrab() {
+    const domain = document.getElementById('domain-input').value.trim();
+    if (!domain) return;
+
+    const progress = document.getElementById('progress');
+    const progressText = document.getElementById('progress-text');
+    const progressFill = document.getElementById('progress-fill');
+    progress.classList.add('active');
+    progressText.textContent = '正在启动...';
+    progressFill.style.width = '0%';
+
+    // Close previous SSE
+    if (currentEventSource) currentEventSource.close();
+
+    fetch(`/api/sessions/grab?domain=${encodeURIComponent(domain)}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                showToast(data.error, 'error');
+                progress.classList.remove('active');
+                return;
+            }
+            currentTaskId = data.task_id;
+            listenProgress(data.task_id);
+        })
+        .catch(e => {
+            showToast('请求失败: ' + e.message, 'error');
+            progress.classList.remove('active');
+        });
+}
+
+function listenProgress(taskId) {
+    const progressText = document.getElementById('progress-text');
+    const progressFill = document.getElementById('progress-fill');
+    const progress = document.getElementById('progress');
+
+    const stages = { waiting: 15, listing: 30, found: 45, selecting: 50, navigating: 55, evaluating: 80, done: 95 };
+
+    currentEventSource = new EventSource(`/api/sessions/grab/progress?task_id=${taskId}`);
+
+    currentEventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        progressText.textContent = data.detail;
+        const pct = stages[data.stage] || 50;
+        progressFill.style.width = pct + '%';
+
+        if (data.stage === 'completed') {
+            progressFill.style.width = '100%';
+            progressText.textContent = data.detail;
+            setTimeout(() => {
+                progress.classList.remove('active');
+                htmx.trigger('#session-list', 'refresh-sessions');
+                showToast(data.detail, 'success');
+            }, 800);
+            currentEventSource.close();
+        }
+        if (data.stage === 'error') {
+            progressFill.style.background = 'var(--red)';
+            progressText.textContent = '✗ ' + data.detail;
+            setTimeout(() => progress.classList.remove('active'), 3000);
+            showToast(data.detail, 'error');
+            currentEventSource.close();
+        }
+    };
+
+    currentEventSource.onerror = () => {
+        if (currentEventSource.readyState === EventSource.CLOSED) {
+            progress.classList.remove('active');
+        }
+    };
+}
+
+function deleteSession(domain) {
+    if (!confirm(`确认删除 ${domain}？`)) return;
+    fetch(`/api/sessions/${encodeURIComponent(domain)}`, { method: 'DELETE' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) showToast(data.error, 'error');
+            else showToast(`已删除 ${domain}`, 'success');
+            htmx.trigger('#session-list', 'refresh-sessions');
+        });
+}
+
+function domainToId(domain) {
+    return 'detail-' + encodeURIComponent(domain);
+}
+
+function toggleDetail(encodedDomain) {
+    const el = document.getElementById('detail-' + encodedDomain);
+    if (!el) return;
+    if (el.style.display === 'none') {
+        const originalDomain = decodeURIComponent(encodedDomain);
+        fetch(`/api/sessions/${encodeURIComponent(originalDomain)}`)
+            .then(r => r.json())
+            .then(site => {
+                let html = '<div class="card" style="margin-top:10px"><h3>Cookie 详情</h3>';
+                for (const [k, v] of Object.entries(site.cookies || {})) {
+                    const dv = v.length > 50 ? v.slice(0, 50) + '...' : v;
+                    html += `<div class="detail-row"><span class="detail-name">${escHtml(k)}</span><span class="detail-value">${escHtml(dv)}</span></div>`;
+                }
+                html += '</div>';
+                el.innerHTML = html;
+                el.style.display = 'block';
+            });
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function showToast(msg, type) {
+    const t = document.createElement('div');
+    t.className = 'toast toast-' + type;
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 3000);
+}
+</script>
+
+<!-- Server-side rendered session list (fallback) -->
+<script>
+// HTMX will call /api/sessions which returns JSON.
+// We use a custom extension to render the JSON as HTML.
+document.body.addEventListener('htmx:beforeSwap', function(evt) {
+    if (evt.detail.target.id === 'session-list' && evt.detail.xhr) {
+        try {
+            const data = JSON.parse(evt.detail.xhr.responseText);
+            if (data.error) {
+                evt.detail.serverResponse = `<div class="empty-state">${escHtml(data.error)}</div>`;
+                return;
+            }
+            let html = '';
+            if (!data || data.length === 0) {
+                html = '<div class="empty-state">暂无已存储的站点<br><small>在上方输入域名并点击抓取</small></div>';
+            } else {
+                for (const s of data) {
+                    const tag = s.expired
+                        ? '<span class="session-tag tag-expired">已过期</span>'
+                        : '<span class="session-tag tag-active">可用</span>';
+                    html += `
+                    <div class="session-item">
+                        <span class="session-icon">🌐</span>
+                        <div class="session-info">
+                            <div class="session-domain">${escHtml(s.domain)} ${tag}</div>
+                            <div class="session-meta">${s.cookie_count} 个 Cookie · 过期 ${s.expires_at.slice(0, 10)}</div>
+                        </div>
+                        <div class="session-actions">
+                            <button class="btn btn-sm btn-primary" onclick="toggleDetail('${encodeURIComponent(s.domain)}')">查看</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteSession('${escHtml(s.domain)}')">删除</button>
+                        </div>
+                    </div>
+                    <div id="detail-${encodeURIComponent(s.domain)}" style="display:none"></div>`;
+                }
+            }
+            evt.detail.serverResponse = html;
+        } catch(e) { /* use raw response */ }
+    }
+});
+</script>
+</body>
+</html>

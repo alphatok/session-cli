@@ -1,0 +1,149 @@
+r"""
+Session CLI - 获取和管理浏览器 Session
+
+用法:
+    uv run python main.py init                  # 初始化 Vault
+    uv run python main.py grab <domain>         # 抓取 Session
+    uv run python main.py get <domain>          # 查看 Session
+    uv run python main.py list                  # 列出所有
+    uv run python main.py delete <domain>       # 删除
+    uv run python main.py serve                 # 启动 Web UI
+
+    # 添加 --auto-connect 使用 Chrome 144+ autoConnect
+    uv run python main.py grab yuanbao.tencent.com --auto-connect
+"""
+
+import sys
+from getpass import getpass
+
+import core
+from core.vault import is_vault_ready
+
+DEFAULT_DOMAIN = "yuanbao.tencent.com"
+
+
+def cmd_init():
+    """初始化 Vault（首次使用）。"""
+    if is_vault_ready():
+        print("[✓] Vault 已初始化并解锁")
+        return
+    pw = getpass("设置 Vault 密码: ")
+    confirm = getpass("再次输入: ")
+    if pw != confirm:
+        print("[✗] 密码不一致")
+        sys.exit(1)
+    if core.init_vault(pw):
+        print("[✓] Vault 初始化成功")
+    else:
+        print("[✗] 初始化失败（Vault 可能已存在）")
+        sys.exit(1)
+
+
+def cmd_grab(domain: str, auto_connect: bool):
+    def progress(stage, detail):
+        print(f"  [{stage}] {detail}")
+
+    print(f"[*] 抓取 {domain} ...")
+    try:
+        cookies = core.grab_cookies(domain, auto_connect=auto_connect, on_progress=progress)
+    except RuntimeError as e:
+        print(f"[✗] {e}")
+        sys.exit(1)
+
+    if not cookies:
+        print("[✗] 未获取到 Cookie")
+        sys.exit(1)
+
+    print(f"[✓] 获取到 {len(cookies)} 个 Cookie")
+    info = core.store_site(domain, cookies)
+    print(f"[✓] 已存储到 vault: {info}")
+
+
+def cmd_get(domain: str):
+    site = core.get_site(domain)
+    if site is None:
+        print(f"[✗] 未找到 {domain}")
+        sys.exit(1)
+    status = "⚠ 已过期" if site["expired"] else "✓"
+    print(f"[{status}] {site['domain']} | {site['cookie_count']} cookies")
+    print(f"  创建: {site['created_at']}  过期: {site['expires_at']}")
+    print("\nCookie 列表:")
+    for name, value in site["cookies"].items():
+        dv = value[:30] + "..." if len(value) > 30 else value
+        print(f"  {name} = {dv}")
+
+
+def cmd_list():
+    sites = core.list_sites()
+    if not sites:
+        print("(无)")
+        return
+    print(f"已存储 {len(sites)} 个站点:\n")
+    for s in sites:
+        tag = "✗ 已过期" if s["expired"] else "✓"
+        print(f"  [{tag}] {s['domain']}  ({s['cookie_count']} cookies)")
+
+
+def cmd_delete(domain: str):
+    if core.delete_site(domain):
+        print(f"[✓] 已删除 {domain}")
+    else:
+        print(f"[✗] 未找到 {domain}")
+
+
+def cmd_serve():
+    """启动 Web UI。"""
+    try:
+        from server import app
+        import uvicorn
+        print("[*] 启动 Session Manager Web UI: http://127.0.0.1:8000")
+        uvicorn.run(app, host="127.0.0.1", port=8000)
+    except ImportError:
+        print("[✗] 请先安装 Web 依赖: uv add fastapi uvicorn jinja2")
+        sys.exit(1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(0)
+
+    # 解析 --auto-connect（显式循环，清晰直观）
+    auto_connect = False
+    args = []
+    for a in sys.argv[1:]:
+        if a in ("--auto-connect", "-autoConnect"):
+            auto_connect = True
+        else:
+            args.append(a)
+
+    if not args:
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = args[0].lower()
+    rest = args[1:]
+
+    if cmd == "init":
+        cmd_init()
+    elif cmd == "grab":
+        domain = rest[0] if rest else DEFAULT_DOMAIN
+        cmd_grab(domain, auto_connect)
+    elif cmd == "get":
+        domain = rest[0] if rest else DEFAULT_DOMAIN
+        cmd_get(domain)
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "delete":
+        domain = rest[0] if rest else DEFAULT_DOMAIN
+        cmd_delete(domain)
+    elif cmd == "serve":
+        cmd_serve()
+    else:
+        print(f"未知命令: {cmd}")
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
