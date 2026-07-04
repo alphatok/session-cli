@@ -9,7 +9,7 @@ Session CLI Core — 统一公共 API
 
 from core.mcp import grab_cookies
 from core.vault import get_vault, init_vault, unlock_vault
-from core.session import list_sites, get_site, store_site, delete_site
+from core.session import list_sites, get_site, store_site, delete_site, query_session
 
 __all__ = [
     # MCP
@@ -23,4 +23,6 @@ __all__ = [
     "get_site",
     "store_site",
     "delete_site",
+    # Lookup
+    "query_session",
 ]

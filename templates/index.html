@@ -659,14 +659,17 @@ function toggleDetail(encodedDomain) {
                     html += `<div class="detail-row"><span class="detail-name">原始字符串</span><span class="detail-value">${escHtml(cookies)}</span></div>`;
                 }
 
-                // 认证凭据区域
+                // 认证凭据区域（必须点击展开）
                 const authTokens = site.auth_tokens || [];
-                html += `<div class="detail-section-title">🔐 认证凭据 <span class="auth-badge">${authTokens.length}</span></div>`;
                 if (authTokens.length > 0) {
+                    html += `<details class="auth-section-details">`;
+                    html += `<summary class="detail-section-title" style="cursor:pointer;list-style:none">🔐 认证凭据 <span class="auth-badge">${authTokens.length}</span></summary>`;
                     for (const t of authTokens) {
                         html += `<div class="detail-row detail-row-auth"><span class="detail-name">${escHtml(t.key)} <small style="color:var(--text-dim)">[${t.source}]</small></span>${detailValueHtml(t.key, t.value, 200)}</div>`;
                     }
+                    html += `</details>`;
                 } else {
+                    html += `<div class="detail-section-title">🔐 认证凭据 <span class="auth-badge">0</span></div>`;
                     html += '<div class="empty-state" style="padding:6px;font-size:12px;color:var(--text-dim)">暂无</div>';
                 }
 

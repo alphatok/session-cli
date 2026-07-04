@@ -299,6 +299,107 @@ def store_site(domain: str, data: dict, original_url: str = "") -> dict:
     }
 
 
+def query_session(
+    domain: str,
+    subdomain_match: bool = True,
+    include_expired: bool = False,
+) -> dict:
+    """按域名查询已存储的 Cookie + Header（纯只读，不触发抓取）。
+
+    稳定程序化调用入口，返回精简 dict，适合脚本/自动化场景。
+
+    Args:
+        domain: 要查询的域名，如 "api.example.com" 或 "https://example.com/path"
+        subdomain_match: 是否启用子域名回退匹配（默认 True）。
+                         例如查 "api.example.com" 若未精确命中，自动回退查找 "example.com"。
+        include_expired: 是否包含已过期数据（默认 False，跳过过期条目）。
+
+    Returns:
+        dict:
+            found (bool):         是否找到匹配
+            domain (str):         实际匹配到的存储域名
+            matched_by (str):     "exact" | "subdomain" | ""
+            cookies (str):        原始 cookie 字符串
+            headers (dict):       公共 Request Headers {key: value}
+            auth_tokens (list):   认证凭据 [{source, key, value}]
+            expired (bool):       是否过期
+            expires_at (str):     ISO 8601 过期时间
+    """
+    # 清洗输入域名：去掉协议和路径，只保留 hostname
+    clean = domain.strip().lower()
+    for prefix in ("https://", "http://"):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+    clean = clean.split("/")[0]
+
+    vault = get_vault()
+    now = utcnow()
+
+    # 1. 精确匹配
+    session = vault.get_session(clean)
+    matched_domain = clean
+    matched_by = "exact"
+
+    # 2. 子域名回退匹配
+    if session is None and subdomain_match:
+        all_sessions = vault.list_sessions()
+        candidates = []
+        for s in all_sessions:
+            # 查询域名是存储域名的子域名：api.example.com.endswith(.example.com)
+            if clean == s.domain or clean.endswith("." + s.domain):
+                candidates.append(s)
+
+        if candidates:
+            # 最长匹配优先（更精准的父域名）
+            candidates.sort(key=lambda s: len(s.domain), reverse=True)
+            session = candidates[0]
+            matched_domain = session.domain
+            matched_by = "subdomain"
+
+    # 3. 未找到
+    if session is None:
+        return {
+            "found": False,
+            "domain": "",
+            "matched_by": "",
+            "cookies": "",
+            "headers": {},
+            "auth_tokens": [],
+            "expired": True,
+            "expires_at": "",
+        }
+
+    # 4. 解码数据
+    raw_cookies = session.cookies if isinstance(session.cookies, dict) else {}
+    raw_cookie, auth_tokens = _decode_auth_tokens(raw_cookies)
+    headers, _raw_requests = _decode_headers(raw_cookies)
+    expired = session.expires_at.replace(tzinfo=None) <= now.replace(tzinfo=None)
+
+    # 5. 过期过滤
+    if expired and not include_expired:
+        return {
+            "found": False,
+            "domain": "",
+            "matched_by": "",
+            "cookies": "",
+            "headers": {},
+            "auth_tokens": [],
+            "expired": True,
+            "expires_at": session.expires_at.isoformat(),
+        }
+
+    return {
+        "found": True,
+        "domain": matched_domain,
+        "matched_by": matched_by,
+        "cookies": raw_cookie,
+        "headers": headers,
+        "auth_tokens": auth_tokens,
+        "expired": expired,
+        "expires_at": session.expires_at.isoformat(),
+    }
+
+
 def delete_site(domain: str) -> bool:
     """删除指定站点。"""
     vault = get_vault()

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.session import (
-    list_sites, get_site, store_site, delete_site,
+    list_sites, get_site, store_site, delete_site, query_session,
     _encode_auth_tokens, _decode_auth_tokens,
     _encode_headers, _decode_headers,
     _encode_related, _decode_related,
@@ -501,3 +501,226 @@ class TestStoreSiteWithRelated:
         result = store_site("example.com", data)
         assert result["related_domain_count"] == 2
         assert "__rel__domains" in stored_all
+
+
+# ── query_session() 测试 ────────────────────────────────────────
+
+
+class TestQuerySession:
+    """query_session() — 稳定程序化查询接口（精确匹配 + 子域名回退 + 过期过滤）。"""
+
+    @patch("core.session.get_vault")
+    def test_exact_match(self, mock_get_vault):
+        """精确匹配：直接命中存储域名。"""
+        from datetime import datetime, UTC
+        s = MagicMock()
+        s.domain = "example.com"
+        s.cookies = {
+            "__raw__cookie": "token=abc; uid=123",
+            "__hdr__Authorization": "Bearer xxx",
+        }
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = query_session("example.com")
+
+        assert result["found"] is True
+        assert result["domain"] == "example.com"
+        assert result["matched_by"] == "exact"
+        assert result["cookies"] == "token=abc; uid=123"
+        assert result["headers"] == {"Authorization": "Bearer xxx"}
+        assert result["expired"] is False
+
+    @patch("core.session.get_vault")
+    def test_exact_match_cleans_url(self, mock_get_vault):
+        """传入完整 URL 时自动清洗为纯域名再匹配。"""
+        from datetime import datetime, UTC
+        s = MagicMock()
+        s.domain = "example.com"
+        s.cookies = {"__raw__cookie": "token=abc"}
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = query_session("https://example.com/path/to/page")
+
+        assert result["found"] is True
+        assert result["domain"] == "example.com"
+        assert result["matched_by"] == "exact"
+
+    @patch("core.session.get_vault")
+    def test_subdomain_match(self, mock_get_vault):
+        """子域名回退：查 api.example.com → 命中 example.com。"""
+        from datetime import datetime, UTC
+
+        # 精确匹配返回 None
+        parent_s = MagicMock()
+        parent_s.domain = "example.com"
+        parent_s.cookies = {"__raw__cookie": "token=main"}
+        parent_s.created_at = datetime(2026, 1, 1, 12, 0)
+        parent_s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = None  # 精确匹配失败
+        v.list_sessions.return_value = [parent_s]
+        mock_get_vault.return_value = v
+
+        result = query_session("api.example.com")
+
+        assert result["found"] is True
+        assert result["domain"] == "example.com"
+        assert result["matched_by"] == "subdomain"
+        assert result["cookies"] == "token=main"
+
+    @patch("core.session.get_vault")
+    def test_subdomain_match_longest_priority(self, mock_get_vault):
+        """子域名回退：多个父域名时取最长匹配（最精准）。"""
+        from datetime import datetime, UTC
+
+        s_co = MagicMock()
+        s_co.domain = "service.example.com"
+        s_co.cookies = {"__raw__cookie": "token=service"}
+        s_co.created_at = datetime(2026, 1, 1, 12, 0)
+        s_co.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        s_ex = MagicMock()
+        s_ex.domain = "example.com"
+        s_ex.cookies = {"__raw__cookie": "token=root"}
+        s_ex.created_at = datetime(2026, 1, 1, 12, 0)
+        s_ex.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = None
+        # 两个都匹配 "api.service.example.com"
+        v.list_sessions.return_value = [s_ex, s_co]
+        mock_get_vault.return_value = v
+
+        result = query_session("api.service.example.com")
+
+        assert result["found"] is True
+        # 应该匹配更长的 service.example.com
+        assert result["domain"] == "service.example.com"
+        assert result["matched_by"] == "subdomain"
+        assert result["cookies"] == "token=service"
+
+    @patch("core.session.get_vault")
+    def test_subdomain_no_false_match(self, mock_get_vault):
+        """子域名回退：不匹配不相关的域名（如 myexample.com 不应匹配 example.com）。"""
+        from datetime import datetime, UTC
+        s = MagicMock()
+        s.domain = "example.com"
+        s.cookies = {"__raw__cookie": "token=abc"}
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = None
+        v.list_sessions.return_value = [s]
+        mock_get_vault.return_value = v
+
+        result = query_session("myexample.com")
+
+        assert result["found"] is False  # myexample.com 不是 example.com 的子域名
+
+    @patch("core.session.get_vault")
+    def test_not_found(self, mock_get_vault):
+        """完全未命中时返回 found=False。"""
+        v = MagicMock()
+        v.get_session.return_value = None
+        v.list_sessions.return_value = []
+        mock_get_vault.return_value = v
+
+        result = query_session("nonexistent.com")
+
+        assert result["found"] is False
+        assert result["domain"] == ""
+        assert result["matched_by"] == ""
+        assert result["cookies"] == ""
+        assert result["headers"] == {}
+        assert result["auth_tokens"] == []
+
+    @patch("core.session.get_vault")
+    def test_expired_filtered_by_default(self, mock_get_vault):
+        """默认过滤已过期数据，返回 found=False 但带 expires_at。"""
+        from datetime import datetime, UTC
+        s = MagicMock()
+        s.domain = "expired.com"
+        s.cookies = {"__raw__cookie": "token=old"}
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2025, 1, 1, 12, 0)  # 已过期
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = query_session("expired.com")
+
+        assert result["found"] is False
+        assert result["expired"] is True
+        assert result["expires_at"] == "2025-01-01T12:00:00"
+
+    @patch("core.session.get_vault")
+    def test_include_expired(self, mock_get_vault):
+        """include_expired=True 时返回已过期数据。"""
+        from datetime import datetime, UTC
+        s = MagicMock()
+        s.domain = "expired.com"
+        s.cookies = {"__raw__cookie": "token=old"}
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2025, 1, 1, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = query_session("expired.com", include_expired=True)
+
+        assert result["found"] is True
+        assert result["expired"] is True
+        assert result["cookies"] == "token=old"
+
+    @patch("core.session.get_vault")
+    def test_disable_subdomain_match(self, mock_get_vault):
+        """subdomain_match=False 时不进行子域名回退。"""
+        v = MagicMock()
+        v.get_session.return_value = None
+        mock_get_vault.return_value = v
+
+        result = query_session("api.example.com", subdomain_match=False)
+
+        assert result["found"] is False
+        # 确保没有调用 list_sessions（不做回退扫描）
+        v.list_sessions.assert_not_called()
+
+    @patch("core.session.get_vault")
+    def test_returns_auth_tokens(self, mock_get_vault):
+        """返回认证凭据（localStorage/sessionStorage）。"""
+        from datetime import datetime, UTC
+        s = MagicMock()
+        s.domain = "example.com"
+        s.cookies = {
+            "__raw__cookie": "token=abc",
+            "__auth__ls:access_token": "Bearer xxx",
+            "__auth__ss:sess_id": "yyy",
+        }
+        s.created_at = datetime(2026, 1, 1, 12, 0)
+        s.expires_at = datetime(2026, 12, 31, 12, 0)
+
+        v = MagicMock()
+        v.get_session.return_value = s
+        mock_get_vault.return_value = v
+
+        result = query_session("example.com")
+
+        assert result["found"] is True
+        assert len(result["auth_tokens"]) == 2
+        sources = {t["source"] for t in result["auth_tokens"]}
+        assert "localStorage" in sources
+        assert "sessionStorage" in sources

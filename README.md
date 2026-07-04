@@ -14,6 +14,7 @@ Session CLI automates this via Chrome's remote debugging protocol (MCP). One com
 ## Features
 
 - **CLI + Web UI** — grab and view cookies from terminal or browser
+- **Python SDK** — `query_session()` API for script/automation use with subdomain matching
 - **MCP protocol** — communicates with Chrome via the standard Chrome DevTools MCP adapter
 - **Browser mode** — use existing Chrome (user browser) or launch a temporary Chrome instance
 - **Raw storage** — Cookies, auth tokens, and request headers stored as-is, no transformation
@@ -110,10 +111,11 @@ session-cli/
       ┌──────────────┐
       │     core     │
       ├──────────────┤
-      │ grab_cookies │ ◄── MCP + Chrome autoConnect
-      │ list_sites   │ ◄── Romek Vault CRUD
-      │ store_site   │
-      │ delete_site  │
+      │ grab_cookies  │ ◄── MCP + Chrome autoConnect
+      │ query_session │ ◄── Read-only lookup (subdomain match)
+      │ list_sites    │ ◄── Romek Vault CRUD
+      │ store_site    │
+      │ delete_site   │
       └──────────────┘
 ```
 
@@ -137,15 +139,29 @@ Currently, only Chrome is supported through the `@anthropic/chrome-devtools-mcp`
 
 ### 5. How do I use the grabbed cookies in my Python script?
 
+Use `query_session()` for a clean, stable dict result with automatic subdomain matching:
+
 ```python
-from core import list_sites, get_site
-cookies = get_site("example.com")
-# cookies is a list of dicts with name, value, domain, path, etc.
-for c in cookies:
-    print(f"{c['name']}={c['value']}")
+from core import query_session
+
+result = query_session("api.example.com")
+# {
+#     "found": True,
+#     "domain": "example.com",        # matched storage domain
+#     "matched_by": "subdomain",      # "exact" | "subdomain"
+#     "cookies": "token=abc; uid=123",
+#     "headers": {"Authorization": "Bearer xxx"},
+#     "auth_tokens": [{"source": "localStorage", "key": "token", "value": "..."}],
+#     "expired": False,
+#     "expires_at": "2026-08-01T12:00:00",
+# }
+
+if result["found"]:
+    print(result["cookies"])
+    print(result["headers"])
 ```
 
-Or import the vault file directly with Romek in your script for programmatic access.
+See `core/session.py` for full API reference (supports URL cleaning, subdomain fallback, and expired-data filtering).
 
 ## License
 

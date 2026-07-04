@@ -13,6 +13,7 @@ Session CLI 通过 Chrome 远程调试协议（MCP）自动化这一过程。一
 ## 功能特性
 
 - **CLI + Web UI** — 终端或浏览器都能操作
+- **Python SDK** — `query_session()` 程序化查询接口，支持子域名智能匹配
 - **MCP 协议** — 通过标准 Chrome DevTools MCP 适配器与 Chrome 通信
 - **加密存储** — 所有数据存入 Romek Vault，通过系统 Keyring 自动解锁
 - **SSE 实时推送** — Web 界面实时显示抓取进度
@@ -100,10 +101,11 @@ session-cli/
       ┌──────────────┐
       │     core     │
       ├──────────────┤
-      │ grab_cookies │ ◄── MCP + Chrome autoConnect
-      │ list_sites   │ ◄── Romek Vault CRUD
-      │ store_site   │
-      │ delete_site  │
+      │ grab_cookies  │ ◄── MCP + Chrome autoConnect
+      │ query_session │ ◄── 只读查询（子域名匹配）
+      │ list_sites    │ ◄── Romek Vault CRUD
+      │ store_site    │
+      │ delete_site   │
       └──────────────┘
 ```
 
@@ -127,15 +129,29 @@ MCP 适配器会自动发现 Chrome 的调试端口。如果失败，请确保 C
 
 ### 5. 如何在 Python 脚本中使用已抓取的 Cookie？
 
+使用 `query_session()` 获取简洁稳定的 dict 结果，自动支持子域名匹配：
+
 ```python
-from core import list_sites, get_site
-cookies = get_site("example.com")
-# cookies 为字典列表，包含 name、value、domain、path 等字段
-for c in cookies:
-    print(f"{c['name']}={c['value']}")
+from core import query_session
+
+result = query_session("api.example.com")
+# {
+#     "found": True,
+#     "domain": "example.com",        # 实际匹配到的存储域名
+#     "matched_by": "subdomain",      # "exact" | "subdomain"
+#     "cookies": "token=abc; uid=123",
+#     "headers": {"Authorization": "Bearer xxx"},
+#     "auth_tokens": [{"source": "localStorage", "key": "token", "value": "..."}],
+#     "expired": False,
+#     "expires_at": "2026-08-01T12:00:00",
+# }
+
+if result["found"]:
+    print(result["cookies"])
+    print(result["headers"])
 ```
 
-也可以直接在你的脚本中用 Romek 读取 Vault 文件，进行程序化访问。
+完整 API 参考见 `core/session.py`（支持 URL 自动清洗、子域名回退、过期数据过滤）。
 
 ## License
 
